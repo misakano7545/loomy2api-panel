@@ -1,0 +1,32 @@
+services:
+  loomy2api:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: loomy2api-panel:latest
+    container_name: loomy2api-panel
+    restart: unless-stopped
+    ports:
+      # 默认只绑本机；要对外暴露时改成 "17890:17890"，并务必先设置 api_keys
+      - "127.0.0.1:17890:17890"
+    environment:
+      TZ: Asia/Shanghai
+      # 面板密码（也可写进 config.json 的 panel_password）
+      # LOOMY_PANEL_PASSWORD: "换成你的密码"
+      # 网关密钥，逗号分隔
+      # LOOMY_API_KEYS: "sk-loomy-xxx"
+    volumes:
+      # config.json / auths / data（状态与台账）全部落在这个卷里
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:17890/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

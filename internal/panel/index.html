@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loomy2API 网关面板</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">L</span>
+    <div>
+      <h1>Loomy2API</h1>
+      <p class="sub">讯飞 Loomy 账号 → OpenAI / Anthropic 兼容网关</p>
+    </div>
+  </div>
+  <div class="actions">
+    <span id="health" class="pill pill-muted">连接中…</span>
+    <button id="btn-refresh" class="btn">刷新</button>
+    <button id="btn-theme" class="btn btn-ghost" title="切换主题">◑</button>
+  </div>
+</header>
+
+<div id="login-gate" class="gate hidden">
+  <div class="gate-card">
+    <h2>需要访问密钥</h2>
+    <p>请输入面板密码（或配置中的 api_key）。</p>
+    <input id="gate-key" type="password" placeholder="密钥" autocomplete="current-password">
+    <button id="gate-submit" class="btn btn-primary">进入</button>
+    <p id="gate-error" class="err"></p>
+  </div>
+</div>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-view="accounts">账号池</button>
+  <button class="tab" data-view="usage">用量</button>
+  <button class="tab" data-view="models">模型与档位</button>
+  <button class="tab" data-view="logs">运行日志</button>
+  <button class="tab" data-view="config">配置</button>
+</nav>
+
+<main>
+  <!-- 账号池 -->
+  <section id="view-accounts" class="view active">
+    <div class="cards" id="stat-cards"></div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <h2>账号池</h2>
+        <div class="btn-row">
+          <button id="btn-add-toggle" class="btn btn-primary">添加账号</button>
+          <button id="btn-refresh-all" class="btn">全量刷新额度</button>
+          <button id="btn-login-all" class="btn">全量重新登录</button>
+        </div>
+      </div>
+
+      <form id="add-form" class="add-form hidden">
+        <div class="grid-2">
+          <label>名称<input name="name" placeholder="留空用手机号"></label>
+          <label>手机号<input name="loginid" placeholder="13800000000" autocomplete="username"></label>
+          <label>密码<input name="password" type="password" autocomplete="current-password"></label>
+          <label>出口代理<input name="proxy" placeholder="http://127.0.0.1:7890（可留空）"></label>
+        </div>
+        <p class="hint">手机号 + 密码即可全自动登录（14 天有效，到期自动续）。密码保存在 auths/*.json（0600）。</p>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-primary">保存并登录</button>
+          <button type="button" id="btn-add-cancel" class="btn btn-ghost">取消</button>
+        </div>
+      </form>
+
+      <div class="table-wrap">
+        <table id="accounts-table">
+          <thead>
+            <tr>
+              <th>账号</th><th>状态</th><th>可用积分</th><th>登录态</th>
+              <th>请求 / 失败</th><th>在途</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 用量 -->
+  <section id="view-usage" class="view">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>用量</h2>
+        <div class="btn-row">
+          <select id="usage-window" class="select">
+            <option value="today">今天</option>
+            <option value="24h" selected>近 24 小时</option>
+            <option value="3d">近 3 天</option>
+            <option value="7d">近 7 天</option>
+            <option value="30d">近 30 天</option>
+          </select>
+        </div>
+      </div>
+      <div class="cards" id="usage-cards"></div>
+      <div id="hourly-chart" class="chart"></div>
+      <div class="grid-2">
+        <div class="subpanel">
+          <h3>按账号</h3>
+          <table id="usage-by-account"><thead><tr><th>账号</th><th>请求</th><th>token</th><th>积分</th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="subpanel">
+          <h3>按模型</h3>
+          <table id="usage-by-model"><thead><tr><th>模型</th><th>请求</th><th>token</th><th>积分</th></tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 模型 -->
+  <section id="view-models" class="view">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>模型与档位</h2>
+        <input id="model-filter" class="input" placeholder="搜索模型 id / 名称…">
+      </div>
+      <div class="table-wrap">
+        <table id="models-table">
+          <thead><tr><th>ID</th><th>名称</th><th>倍率</th><th>上下文</th><th>最大输出</th><th>能力</th><th>思考档位</th></tr></thead>
+          <tbody><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="view-logs" class="view">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>请求记录</h2>
+        <div class="btn-row">
+          <input id="log-filter" class="input" placeholder="关键词 / IP / 模型…">
+          <select id="log-result" class="select">
+            <option value="">全部结果</option>
+            <option value="ok">成功</option>
+            <option value="fail">失败</option>
+          </select>
+        </div>
+      </div>
+      <div class="table-wrap tall">
+        <table id="requests-table">
+          <thead><tr><th>时间</th><th>结果</th><th>模型</th><th>账号</th><th>来源</th><th>耗时</th><th>token</th><th>积分</th></tr></thead>
+          <tbody><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-head">
+        <h2>服务日志</h2>
+        <label class="checkbox"><input type="checkbox" id="log-autoscroll" checked> 自动滚动</label>
+      </div>
+      <pre id="service-logs" class="logbox">加载中…</pre>
+    </div>
+  </section>
+
+  <!-- 配置 -->
+  <section id="view-config" class="view">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>配置</h2>
+        <span id="config-path" class="mono dim"></span>
+      </div>
+      <form id="config-form" class="config-form"></form>
+      <div class="btn-row">
+        <button id="btn-config-save" class="btn btn-primary">保存</button>
+        <span id="config-note" class="note"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

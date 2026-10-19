@@ -1,0 +1,640 @@
+// Package panel 内嵌 Web 管理面板。
+//
+// 前端资源经 go:embed 打进二进制（无外部构建步骤），路由挂在 /panel/ 下，
+// 数据接口在 /panel/api/*（与网关同一套 Bearer 鉴权，可用 api_key 脚本化调用）。
+package panel
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/misakano7545/loomy2api-panel/internal/account"
+	"github.com/misakano7545/loomy2api-panel/internal/config"
+	"github.com/misakano7545/loomy2api-panel/internal/httpauth"
+	"github.com/misakano7545/loomy2api-panel/internal/pool"
+	"github.com/misakano7545/loomy2api-panel/internal/server"
+	"github.com/misakano7545/loomy2api-panel/internal/upstream"
+	"github.com/misakano7545/loomy2api-panel/internal/usage"
+)
+
+// Panel 管理面板。
+type Panel struct {
+	cfg      *config.Config
+	pool     *pool.Pool
+	accounts *account.Client
+	upstream *upstream.Client
+	ledger   *usage.Ledger
+	models   *server.ModelCache
+
+	mux *http.ServeMux
+
+	logMu   sync.Mutex
+	logRing []string
+
+	version string
+
+	// 账号级互斥：同一账号不允许并发跑登录/刷新等运维动作。
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
+}
+
+// New 构造面板。
+func New(cfg *config.Config, p *pool.Pool, acc *account.Client, up *upstream.Client,
+	ledger *usage.Ledger, models *server.ModelCache, version string) *Panel {
+	pl := &Panel{
+		cfg: cfg, pool: p, accounts: acc, upstream: up,
+		ledger: ledger, models: models, version: version,
+		mux:   http.NewServeMux(),
+		locks: map[string]*sync.Mutex{},
+	}
+	pl.routes()
+	return pl
+}
+
+// Logf 记录一行面板日志（面板「运行日志」页展示）。
+func (p *Panel) Logf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	line := time.Now().Format("15:04:05 ") + msg
+	log.Print(msg)
+	p.logMu.Lock()
+	p.logRing = append(p.logRing, line)
+	if len(p.logRing) > 500 {
+		p.logRing = p.logRing[len(p.logRing)-500:]
+	}
+	p.logMu.Unlock()
+}
+
+func (p *Panel) routes() {
+	p.mux.HandleFunc("GET /panel/{$}", p.index)
+	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/style.css", p.styleSheet)
+
+	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.listAccounts))
+	p.mux.HandleFunc("POST /panel/api/accounts", p.withAuth(p.addAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/login", p.withAuth(p.loginAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/refresh", p.withAuth(p.refreshAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/enable", p.withAuth(p.enableAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/disable", p.withAuth(p.disableAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/revive", p.withAuth(p.reviveAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/remove", p.withAuth(p.removeAccount))
+	p.mux.HandleFunc("GET /panel/api/accounts/{name}/points", p.withAuth(p.accountPoints))
+
+	p.mux.HandleFunc("POST /panel/api/refresh_all", p.withAuth(p.refreshAll))
+	p.mux.HandleFunc("POST /panel/api/login_all", p.withAuth(p.loginAll))
+
+	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsHandler))
+	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageHandler))
+	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.requests))
+	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
+	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+}
+
+// ServeHTTP 挂载到 /panel/。
+func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	p.mux.ServeHTTP(w, r)
+}
+
+// withAuth 鉴权包装。面板密码独立于 api_key：设了 panel_password 就要求它，
+// 否则沿用 api_key 口径（两者都空则该面板完全开放，仅限内网）。
+func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		keys := p.cfg.APIKeys
+		if p.cfg.PanelPass != "" {
+			keys = []string{p.cfg.PanelPass}
+		}
+		if !httpauth.Verify(r, keys) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			writeJSON(w, map[string]any{"error": "invalid key"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ------------------------------------------------------------------ 视图
+
+func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
+	ov := p.pool.Overview()
+	ov["version"] = p.version
+	ov["api_key_set"] = len(p.cfg.APIKeys) > 0
+	ov["panel_password_set"] = p.cfg.PanelPass != ""
+	ov["listen"] = p.cfg.Listen
+	ov["upstream"] = p.cfg.Upstream
+	ov["default_model"] = p.cfg.DefaultModel
+
+	windows := map[string]int64{"24h": 86400, "today": todaySeconds(), "3d": 3 * 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+	sum := p.ledger.Summary(windows)
+	ov["usage"] = sum
+	ov["hourly"] = p.ledger.Hourly(24)
+	writeJSON(w, ov)
+}
+
+func (p *Panel) listAccounts(w http.ResponseWriter, r *http.Request) {
+	out := make([]map[string]any, 0, p.pool.Count())
+	for _, a := range p.pool.All() {
+		out = append(out, a.Public())
+	}
+	writeJSON(w, map[string]any{"accounts": out, "overview": p.pool.Overview()})
+}
+
+func (p *Panel) modelsHandler(w http.ResponseWriter, r *http.Request) {
+	list := p.models.Get(r.Context(), p.anySession())
+	writeJSON(w, map[string]any{"models": list})
+}
+
+func (p *Panel) usageHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, to := parseRange(q.Get("from"), q.Get("to"))
+	var win *usage.Window
+	if from > 0 || to > 0 {
+		win = p.ledger.Range(from, to)
+	} else {
+		win = p.ledger.Summary(map[string]int64{"7d": 7 * 86400})["7d"]
+	}
+	hours := 24
+	if v := q.Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 24*30 {
+			hours = n
+		}
+	}
+	writeJSON(w, map[string]any{
+		"window": win,
+		"hourly": p.ledger.Hourly(hours),
+		"models": p.ledger.Models(),
+	})
+}
+
+func (p *Panel) requests(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit := 200
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 2000 {
+			limit = n
+		}
+	}
+	from, to := parseRange(q.Get("from"), q.Get("to"))
+	filter := usage.RecordFilter{
+		From: from, To: to,
+		Keyword: q.Get("q"),
+		Result:  q.Get("result"),
+		Model:   q.Get("model"),
+		Account: q.Get("account"),
+	}
+	writeJSON(w, map[string]any{"records": p.ledger.Recent(limit, filter)})
+}
+
+func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
+	p.logMu.Lock()
+	lines := make([]string, len(p.logRing))
+	copy(lines, p.logRing)
+	p.logMu.Unlock()
+	writeJSON(w, map[string]any{"lines": lines})
+}
+
+func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"config": p.cfg.Public(),
+		"path":   p.cfg.Path(),
+	})
+}
+
+func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
+	var patch map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeJSON(w, map[string]any{"error": "请求体必须是对象: " + err.Error()})
+		return
+	}
+	restart, err := p.cfg.Save(patch)
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	// 池参数热生效
+	p.pool.SetOptions(poolOptions(p.cfg))
+	p.Logf("配置已保存（%d 项）", len(patch))
+	writeJSON(w, map[string]any{
+		"ok": true, "restart_required": restart,
+		"message": restartMsg(restart),
+	})
+}
+
+// ------------------------------------------------------------------ 账号运维
+
+func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name     string `json:"name"`
+		LoginID  string `json:"loginid"`
+		Password string `json:"password"`
+		Session  string `json:"session"`
+		Proxy    string `json:"proxy"`
+		Login    bool   `json:"login"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, map[string]any{"error": "请求体解析失败: " + err.Error()})
+		return
+	}
+	body.LoginID = strings.TrimSpace(body.LoginID)
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Name == "" {
+		body.Name = body.LoginID
+	}
+	if body.Name == "" {
+		writeJSON(w, map[string]any{"error": "name / loginid 至少填一个"})
+		return
+	}
+	if body.LoginID == "" && body.Session == "" {
+		writeJSON(w, map[string]any{"error": "需要 loginid + password，或直接给 session"})
+		return
+	}
+
+	acc := &pool.Account{
+		Name:     body.Name,
+		LoginID:  body.LoginID,
+		Password: body.Password,
+		Proxy:    body.Proxy,
+		Enabled:  true,
+		Identity: account.NewIdentity(),
+	}
+	if body.Session != "" {
+		acc.Session = body.Session
+		acc.ObtainedAt = time.Now().Unix()
+		acc.ExpireAt = acc.ObtainedAt + account.SessionExpireSeconds
+	}
+	p.pool.Add(acc)
+
+	// 有手机号 + 密码就立刻登录一次，验证凭证并拿 session。
+	if body.Login && body.LoginID != "" && body.Password != "" {
+		if err := p.doLogin(acc); err != nil {
+			p.Logf("账号 %s 加入，但登录失败：%v", acc.Name, err)
+			p.persist(acc)
+			writeJSON(w, map[string]any{"ok": false, "error": "账号已加入，但登录失败: " + err.Error()})
+			return
+		}
+	}
+	p.persist(acc)
+	p.Logf("新增账号 %s（登录态 %v）", acc.Name, acc.SessionValid())
+	go p.refreshQuota(acc)
+	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	if !p.tryLock(name) {
+		writeJSON(w, map[string]any{"error": "该账号正在执行其它运维动作"})
+		return
+	}
+	defer p.unlock(name)
+
+	if err := p.doLogin(acc); err != nil {
+		acc.SetLastError("登录失败: " + err.Error())
+		p.Logf("账号 %s 登录失败：%v", name, err)
+		p.persist(acc)
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	acc.Enabled = true
+	acc.ResetCooldowns()
+	p.persist(acc)
+	p.Logf("账号 %s 登录成功（14 天有效）", name)
+	go p.refreshQuota(acc)
+	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	p.persist(acc)
+	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+func (p *Panel) accountPoints(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	obj, err := p.upstream.Points(ctx, acc.Session, 5)
+	if err != nil {
+		writeJSON(w, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, obj)
+}
+
+func (p *Panel) enableAccount(w http.ResponseWriter, r *http.Request) {
+	p.toggleAccount(w, r, true)
+}
+
+func (p *Panel) disableAccount(w http.ResponseWriter, r *http.Request) {
+	p.toggleAccount(w, r, false)
+}
+
+func (p *Panel) toggleAccount(w http.ResponseWriter, r *http.Request, enabled bool) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	acc.Enabled = enabled
+	p.persist(acc)
+	if enabled {
+		p.Logf("账号 %s 已启用", name)
+	} else {
+		p.Logf("账号 %s 已禁用（不参与选号，定时任务仍可手动跑）", name)
+	}
+	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+func (p *Panel) reviveAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	acc.ResetCooldowns()
+	acc.Enabled = true
+	acc.SetLastError("")
+	p.persist(acc)
+	p.Logf("账号 %s 已解冻（冷却与熔断清零）", name)
+	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+func (p *Panel) removeAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		return
+	}
+	p.pool.Remove(name)
+	if err := pool.RemoveAccountFile(p.cfg.Resolve(p.cfg.AuthDir), name); err != nil {
+		p.Logf("账号 %s 已移出池，但删除凭证文件失败：%v", name, err)
+	}
+	p.Logf("账号 %s 已移除", name)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
+	accounts := p.pool.All()
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	var mu sync.Mutex
+	results := make([]map[string]any, 0, len(accounts))
+	for _, a := range accounts {
+		if !a.Enabled || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := p.refreshQuotaCtx(ctx, a)
+			mu.Lock()
+			defer mu.Unlock()
+			item := map[string]any{"name": a.Name, "ok": err == nil}
+			if err != nil {
+				item["error"] = err.Error()
+			}
+			results = append(results, item)
+		}(a)
+	}
+	wg.Wait()
+	p.Logf("全量刷新额度：%d 个账号", len(results))
+	writeJSON(w, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
+}
+
+func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
+	accounts := p.pool.All()
+	type result struct {
+		Name  string `json:"name"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 2)
+	var mu sync.Mutex
+	var results []result
+
+	for _, a := range accounts {
+		if a.LoginID == "" || a.Password == "" {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			err := p.doLogin(a)
+			mu.Lock()
+			defer mu.Unlock()
+			res := result{Name: a.Name, OK: err == nil}
+			if err != nil {
+				res.Error = err.Error()
+			} else {
+				p.persist(a)
+			}
+			results = append(results, res)
+		}(a)
+	}
+	wg.Wait()
+	okCount := 0
+	for _, res := range results {
+		if res.OK {
+			okCount++
+		}
+	}
+	p.Logf("全量重新登录：成功 %d / %d", okCount, len(results))
+	writeJSON(w, map[string]any{"ok": true, "results": results})
+}
+
+// ------------------------------------------------------------------ 内部
+
+func (p *Panel) doLogin(acc *pool.Account) error {
+	if acc.LoginID == "" || acc.Password == "" {
+		return fmt.Errorf("缺少手机号或密码，无法自动登录")
+	}
+	if acc.Identity.DevID == "" {
+		acc.Identity = account.NewIdentity()
+	}
+	res, err := p.accounts.LoginByPassword(acc.LoginID, acc.Password, acc.Identity)
+	if err != nil {
+		return err
+	}
+	acc.Session = res.Session
+	acc.UserID = res.UserID
+	acc.ObtainedAt = time.Now().Unix()
+	acc.ExpireAt = acc.ObtainedAt + account.SessionExpireSeconds
+	return nil
+}
+
+func (p *Panel) refreshQuota(acc *pool.Account) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
+		p.Logf("账号 %s 额度刷新失败：%v", acc.Name, err)
+		return
+	}
+	p.persist(acc)
+}
+
+func (p *Panel) refreshQuotaCtx(ctx context.Context, acc *pool.Account) error {
+	if !acc.SessionValid() {
+		return fmt.Errorf("登录态已失效，需要重新登录")
+	}
+	balance, daily, available, err := p.upstream.Quota(ctx, acc.Session)
+	if err != nil {
+		return err
+	}
+	acc.SetQuota(balance, daily, available)
+	return nil
+}
+
+func (p *Panel) persist(acc *pool.Account) {
+	if err := pool.SaveAccount(p.cfg.Resolve(p.cfg.AuthDir), acc); err != nil {
+		p.Logf("账号 %s 凭证落盘失败：%v", acc.Name, err)
+	}
+}
+
+func (p *Panel) anySession() string {
+	for _, a := range p.pool.All() {
+		if a.Enabled && a.SessionValid() {
+			return a.Session
+		}
+	}
+	return ""
+}
+
+func (p *Panel) tryLock(name string) bool {
+	p.locksMu.Lock()
+	m := p.locks[name]
+	if m == nil {
+		m = &sync.Mutex{}
+		p.locks[name] = m
+	}
+	p.locksMu.Unlock()
+	return m.TryLock()
+}
+
+func (p *Panel) unlock(name string) {
+	p.locksMu.Lock()
+	m := p.locks[name]
+	p.locksMu.Unlock()
+	if m != nil {
+		m.Unlock()
+	}
+}
+
+// poolOptions 把配置映射成池参数。
+func poolOptions(cfg *config.Config) pool.Options {
+	return pool.Options{
+		Strategy:         cfg.Strategy,
+		PickTopN:         cfg.PickTopN,
+		MaxInFlight:      cfg.MaxInFlight,
+		BalanceFloor:     int64(cfg.BalanceFloor),
+		SoftRateBase:     float64(cfg.SoftRateBaseSeconds),
+		SoftRateMax:      float64(cfg.SoftRateMaxSeconds),
+		NotFoundCool:     float64(cfg.NotFoundCooldownSec),
+		CooldownFallback: float64(cfg.CooldownSeconds),
+		BreakerThreshold: cfg.BreakerThreshold,
+		BreakerBase:      float64(cfg.BreakerBaseSeconds),
+		BreakerMax:       float64(cfg.BreakerMaxSeconds),
+		StickyTTL:        float64(cfg.StickyTTLSeconds),
+		StickyMaxEntries: cfg.StickyMaxEntries,
+	}
+}
+
+// PoolOptions 供 main 复用同一份映射。
+func PoolOptions(cfg *config.Config) pool.Options { return poolOptions(cfg) }
+
+func todaySeconds() int64 {
+	now := time.Now()
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	return int64(now.Sub(start).Seconds())
+}
+
+// parseRange 解析 from/to（支持 unix 秒与 YYYY-MM-DD[THH:MM] 两种形态）。
+func parseRange(fromStr, toStr string) (int64, int64) {
+	var from, to int64
+	if v := strings.TrimSpace(fromStr); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			from = n
+		} else if t, err := parseTime(v); err == nil {
+			from = t
+		}
+	}
+	if v := strings.TrimSpace(toStr); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			to = n
+		} else if t, err := parseTime(v); err == nil {
+			to = t
+		}
+	}
+	if from > 0 && to == 0 {
+		to = time.Now().Unix()
+	}
+	return from, to
+}
+
+func parseTime(s string) (int64, error) {
+	layouts := []string{
+		"2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02",
+		time.RFC3339,
+	}
+	for _, l := range layouts {
+		if t, err := time.ParseInLocation(l, s, time.Local); err == nil {
+			return t.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("无法解析时间: %s", s)
+}
+
+func restartMsg(keys []string) string {
+	if len(keys) == 0 {
+		return "已保存，全部热生效"
+	}
+	sort.Strings(keys)
+	return "已保存；以下字段需重启进程生效: " + strings.Join(keys, ", ")
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
