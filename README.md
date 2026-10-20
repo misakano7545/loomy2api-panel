@@ -13,7 +13,7 @@
   <img alt="Go" src="https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic-412991?style=flat-square">
   <img alt="Deps" src="https://img.shields.io/badge/Dependencies-zero-brightgreen?style=flat-square">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-182%20passing-brightgreen?style=flat-square">
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-207%20passing-brightgreen?style=flat-square">
 </p>
 
 ---
@@ -40,9 +40,12 @@ Loomy2API 是一个自托管的 **反向代理网关**，把讯飞 Loomy（`loom
 |---|---|
 | 🔑 **密码自动登录** | 存手机号 + 密码，网关自己走 RSA + HMAC-SHA1 签名登录，14 天登录态到期自动重登 |
 | 📅 **模拟签到领积分** | 复刻官方客户端启动即调的 `points/first-login`（幂等领每日 5000）：面板单号/全量签到按钮、登录成功自动签到、定时额度刷新顺带跨日自动续领 |
+| 🎁 **新手任务直领** | 上游 8 个新手任务合计 **10000 积分**，服务端**不校验前置行为**（不用真的发对话 / 生成 PPT / 装技能），网关纯 API 直领、零 token 消耗；登录 / 签到 / 定时刷额度都会顺带补领，面板有单号与全量按钮 |
+| 🚫 **失效模型台账** | 上游对「不在目录 / 已下架」的模型回 404，这与账号无关（换号、等冷却都不会好）。网关把它记成**模型级**台账并从 `/v1/models` 隐藏、请求直接 404，**不罚账号**（连失败数都不涨），30 天 TTL 自愈 + 面板可手动解除 |
+| 🔒 **严格模型校验** | Loomy 对**认不出的模型名**不报错，而是静默用默认模型执行并回 200（实测 `no-such-model-xyz` → 响应 `model` 变成 `DeepSeek-V4.1-Flash`，按默认模型扣分）。网关因此在目录层面直接 404，客户端不会拿到"成功"的错答案 |
 | 🆓 **模型限免识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`）——网关解析出倍率/限免标记，面板出「限免」标签、限免数统计与「限免优先」排序 |
 | 🖼️ **图像模型分道** | 上游 `type=image` 的模型只能走 `/v1/images/generations`，对 `/chat/completions` 上游一律回 404。网关在目录里标注 `endpoint` / `supports_chat=false`，并在对话端点上直接 400 指路，不让一个选错模型的请求白烧上游、连带把账号打进 404 短冷却 |
-| 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选短名单 + 防惊群 |
+| 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选短名单 + 防惊群；**每日赠送额度优先**（按自然日清零的那份先花，永久积分垫后） |
 | 🛡️ **熔断与冷却** | 429 软冷却指数退避（封顶可配）、404 短冷却、额度耗尽硬冷却到次日 04:00、连败熔断、单号在途租约 |
 | 🧲 **会话粘性** | 同一会话尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
 | ⚡ **双协议** | OpenAI `chat_completions` + `responses`，Anthropic `messages`（流式、工具调用、思考链全支持） |
@@ -126,6 +129,9 @@ curl http://127.0.0.1:17890/v1/responses \
 | GET | `/panel/` | — | Web 管理面板（账号池 / 用量 / 积分构成 / 模型档位 / 配置 / 日志） |
 | POST | `/panel/api/accounts/{name}/checkin` | — | 单号签到（幂等，`first-login`） |
 | POST | `/panel/api/checkin_all` | — | 全量签到（跳过禁用/登录态失效） |
+| POST | `/panel/api/onboarding_all` · `/panel/api/accounts/{name}/onboarding` | — | 领新手任务（8 项合计 10000 积分，幂等） |
+| GET | `/panel/api/dead_models` · `/dead_models/{model}/clear` | — | 失效模型台账与手动解除 |
+| POST | `/panel/api/accounts/{name}/remark` | — | 账号备注（落盘 `auths/<账号>.json`，空串 = 清除） |
 | POST | `/panel/api/accounts/{name}/pause` · `/resume` | — | 暂停选号（照常签到/刷额度）与恢复 |
 | GET | `/panel/api/packages` | — | 积分构成（每日赠送 / 长期 / 来源包 + 邀请码） |
 | GET | `/panel/api/credit_history` | — | 积分流水（跨账号按时间） |
@@ -200,14 +206,16 @@ weight = 余额占比 ×10  +  闲置补偿 ×1  +  成功率 ×3
 ```bash
 go build ./...        # 构建
 go vet ./...          # 静态检查
-go test ./...         # 182 个单测
+go test ./...         # 207 个单测
 gofmt -l .            # 格式检查（应无输出）
 ```
 
 测试覆盖：签名与 RSA 往返、选号分布与排他、冷却退避与封顶、熔断、模型级冷却、
 积分保底、粘性 TTL 与容量、错误分类、SSE 解析与聚合、Anthropic/Responses 双向翻译
-（含工具调用与思考链）、图像模型在对话端点被本地 400 拦住且不打上游、配置读写与脱敏、
-鉴权、面板渲染与安全头、台账落盘与重启恢复。
+（含工具调用与思考链）、图像模型在对话端点被本地 400 拦住且不打上游、未知模型在目录层面
+404 且不打上游、账号备注落盘与额度刷新后不丢、404 记模型台账不罚账号（含 TTL 与持久化）、
+每日赠送额度优先分档、额度冷却终点为自然日 00:00、新手任务幂等与积分表合计、
+配置读写与脱敏、鉴权、面板渲染与安全头、台账落盘与重启恢复。
 
 ## 安全与合规
 

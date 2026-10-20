@@ -166,7 +166,7 @@ body: { model, messages, temperature, max_tokens, stream,
 }]}
 ```
 
-两个必须注意的口径：
+几条必须注意的口径：
 
 1. **没有 `multiplier` 字段**。倍率写在 `name` 的括号里：`(x2.0)`、`（x4.0）`
    全角括号也出现过。网关用 `[（(]\s*[xX×]\s*([0-9.]+)\s*[）)]` 解析，缺失则留空。
@@ -176,13 +176,24 @@ body: { model, messages, temperature, max_tokens, stream,
    额外输出 `is_free` / `multiplier: 0`（OpenAI 兼容客户端可忽略）。
 3. `capabilities` 是**对象**（布尔键 + `input_modalities` 数组），不是数组；
    `type=chat|image` 决定是否图像模型；`auto` 是路由型模型，无倍率。
-4. **图像模型（`type=image`）只服务 `/images/generations`**：对 `/chat/completions`
+4. **认不出的模型名不会报错，而是静默回落默认模型**（2026-10-21 实测）：
+   `{"model":"no-such-model-xyz"}` 返回 **HTTP 200**，而响应体里的 `model` 变成
+   `DeepSeek-V4.1-Flash` —— 客户端拿到一个"成功"的错答案，积分按默认模型扣。
+   这与「未知请求字段静默忽略」是同一套上游行为。**网关因此必须自己做目录校验**
+   （`strict_model_check`，默认开）：不在 `/models` 里的模型直接 404，不打上游；
+   响应 `model` 与请求不一致时另记一条告警，作为第二道证据。
+
+5. **图像模型（`type=image`）只服务 `/images/generations`**：对 `/chat/completions`
    上游统一回 `404 该模型暂未开放，请切换其他模型`（与「模型名写错」不可区分）。
    网关因此把它们从对话路径上摘掉——`/v1/models` 对这类条目输出
    `endpoint: "/v1/images/generations"` 与 `supports_chat: false`，三个对话端点
    （`chat_completions` / `responses` / `messages`）在本地直接 400 指路，不打上游。
-   上游 404 会按 `FaultNotFound` 触发账号短冷却，所以这层拦截同时避免「选错模型 →
-   唯一账号被冻 60s」的连带故障。
+   而**上游 404 本身也不再罚账号**：它记进模型级失效台账（见下），请求直接 404、
+   不打上游，30 天 TTL 自愈。
+
+6. **404 ≠ 账号故障**：`该模型暂未开放` 这类 404 只说明这个**模型**不可用，换号、
+   等冷却都不会好。旧实现按 `FaultNotFound` 罚账号 60 秒，一个打错模型名的请求就能
+   把池里所有号依次冻掉。现在改为：记模型台账 + 从 `/v1/models` 隐藏 + 不重试不罚号。
 
 ### 5.3 额度与积分
 
@@ -284,6 +295,30 @@ POST {base}/points/first-login          # body: {}
 `code: "000000"` 表示成功，`desc: "成功"`。早期的错误信封判定只认 `"0"` / `"200"`，
 把每一个成功的积分响应都改判成 502，导致额度刷新永久失败——而 `points/records`
 本身是好的，问题出在本地判定。单测 `TestErrEnvelopeSuccessCodes` 覆盖了各成功码形态。
+
+#### 5.3.4 每日额度的重置时刻 = 自然日 00:00（2026-10-21 实测）
+
+`dailyBalance` 按**自然日**重置（0 点后即可继续用），不是「撞墙时刻 + 24h」，也不是
+本地 04:00。额度耗尽的硬冷却终点因此取次日 00:00（`pool.NextDailyReset`）——
+按 04:00 会让 23:50 烧空额度的账号白等 4 小时。
+
+⚠️ 这个口径不可从别家实现互抄：WorkBuddy 的每日周期是 04:00，两家结算周期不同。
+
+#### 5.3.5 新手任务（`/onboarding/*`，合计 10000 积分）
+
+```
+GET  {base}/onboarding/tasks            → data.tasks{8 key: bool}, data.earned, data.total
+POST {base}/onboarding/tasks/complete   body {"key":"..."} → data{alreadyCompleted, balance}
+```
+
+- **服务端不校验前置行为**（2026-10-21 实测）：直接 POST 即可拿分，不需要真的发对话 /
+  生成 PPT / 安装技能 —— 完成条件全在客户端本地判定，服务端只做「幂等置位 + 加分」。
+- 8 项与分值：`first_message` 500 / `pick_skill` 1000 / `generate_ppt` 1500 /
+  `set_schedule` 1000 / `install_skill` 1500 / `configure_remote` 1000 /
+  `create_soul` 1500 / `share_soul` 2000（合计 10000）。
+- **幂等判据是响应体的 `alreadyCompleted`**，不是 HTTP 码、不是信封里的 `code`。
+- 响应里的 `earned` 是**累计已领**而非本次增量，网关一律按本地表现算（官方客户端同做法）。
+- 领取后 `balance` 会变，需要再打一次 `points/records` 才能拿到新的 `dailyBalance`。
 
 ### 5.4 长任务与非流式的 504
 

@@ -200,6 +200,19 @@ func (m *ModelCache) Get(ctx context.Context, session string) []config.Model {
 	return list
 }
 
+// Cached 只返回**已从上游拉到的**目录（未拉过返回 nil，不回落到编译期兜底表）。
+//
+// 严格模型校验必须用这个口径：兜底表是编译期快照，拿它判"模型不存在"会把上游
+// 新上的模型、以及测试里的假模型一起 404 掉。缓存为空时调用方应放行。
+func (m *ModelCache) Cached() []config.Model {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.models) == 0 {
+		return nil
+	}
+	return m.models
+}
+
 // Invalidate 强制下次重新拉取。
 func (m *ModelCache) Invalidate() {
 	m.mu.Lock()
@@ -230,6 +243,10 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 	data := make([]map[string]any, 0, len(models))
 	now := time.Now().Unix()
 	for _, m := range models {
+		// 已判定下架的模型不再对外播报：列出来只会让客户端选中一个必然 404 的条目。
+		if h.Pool != nil && h.Pool.ModelDead(m.ID) {
+			continue
+		}
 		item := map[string]any{
 			"id":       m.ID,
 			"object":   "model",
@@ -316,6 +333,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rejectImageModel(w, model)
 		return
 	}
+	if h.rejectUnknownModel(w, model) {
+		return
+	}
+	if h.rejectDeadModel(w, model) {
+		return
+	}
 	stream := truthy(req["stream"])
 	skey := pool.SessionKey(req)
 	extra := headerExtras(r, req)
@@ -371,6 +394,13 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 			usageObj := map[string]any{}
 			if err := json.Unmarshal([]byte(body), &obj); err == nil {
 				usageObj, _ = obj["usage"].(map[string]any)
+				// 上游静默回落到默认模型时，响应里的 model 会变成别的名字：这次请求
+				// 算"成功"但执行的不是客户端要的模型，且按默认模型扣分。strict 校验
+				// 之外再留一条证据，免得 rogue 模型名悄悄烧钱。
+				if got := str(obj["model"]); got != "" && !strings.EqualFold(got, model) &&
+					!strings.EqualFold(strings.TrimPrefix(got, "imodel/"), strings.TrimPrefix(model, "imodel/")) {
+					log.Printf("[model] ⚠️ 上游回落：请求 %s，实际执行 %s（客户端会拿到错答案且账单按后者算）", model, got)
+				}
 			}
 			pts, prompt, completion, reasoning := usageParts(usageObj)
 			h.Pool.ReportSuccess(acc, skey, model, pts)
@@ -658,6 +688,12 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		rejectImageModel(w, model)
 		return
 	}
+	if h.rejectUnknownModel(w, model) {
+		return
+	}
+	if h.rejectDeadModel(w, model) {
+		return
+	}
 	skey := pool.SessionKey(chatReq)
 	extra := headerExtras(r, req)
 
@@ -789,6 +825,15 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	if h.imageOnlyModel(r.Context(), model) {
 		writeAnthropicErr(w, http.StatusBadRequest,
 			"模型 "+model+" 只支持图像生成，不能用于对话；请改调 POST /v1/images/generations")
+		return
+	}
+	if h.Cfg != nil && h.Cfg.StrictModelCheck && !h.catalogHas(r.Context(), model) {
+		writeAnthropicErr(w, http.StatusNotFound,
+			"上游没有模型 "+strings.TrimPrefix(model, "imodel/")+"；可用模型见 GET /v1/models")
+		return
+	}
+	if h.Pool.ModelDead(model) {
+		writeAnthropicErr(w, http.StatusNotFound, deadModelMessage(model))
 		return
 	}
 	skey := pool.SessionKey(chatReq)
@@ -923,6 +968,9 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 			}
 		}
 		model := h.resolveModel(r.Context(), payload)
+		if h.rejectUnknownModel(w, model) {
+			return
+		}
 
 		started := time.Now()
 		var tried []string
@@ -1076,6 +1124,63 @@ func (h *Handler) imageOnlyModel(ctx context.Context, model string) bool {
 		}
 	}
 	return false
+}
+
+// deadModelMessage 模型已被上游判定「暂未开放 / 已下架」时的提示。
+func deadModelMessage(model string) string {
+	return "模型 " + model + " 在上游不可用（404 已下架 / 暂未开放），已从模型列表隐藏；" +
+		"可等它重新上架或改用其它模型"
+}
+
+// catalogHas 判断模型是否在上游目录里（`imodel/` 前缀与大小写不敏感）。
+// 目录为空（还没预热、也没兜底表）时返回 true：宁可放行，也不能因为没查到目录
+// 就把所有请求 404 掉。
+func (h *Handler) catalogHas(ctx context.Context, model string) bool {
+	if h.Models == nil {
+		return true
+	}
+	list := h.Models.Cached()
+	if len(list) == 0 {
+		return true // 目录还没拉到：放行，由上游自己判
+	}
+	id := strings.TrimPrefix(model, "imodel/")
+	for _, m := range list {
+		if strings.EqualFold(strings.TrimPrefix(m.ID, "imodel/"), id) {
+			return true
+		}
+	}
+	return false
+}
+
+// rejectUnknownModel 目录里没有这个模型就直接 404（OpenAI 形态），不打上游。
+//
+// 为什么必须拦：Loomy 对**认不出的模型名**不报错，而是静默用默认模型执行并照常
+// 返回 200（实测 `no-such-model-xyz` → `"model":"DeepSeek-V4.1-Flash"`，按默认
+// 模型扣分）。不拦的话客户端会拿到一个"成功"的错答案，账单也对不上——比 404 更糟。
+// 返回 true 表示已经写过响应。
+func (h *Handler) rejectUnknownModel(w http.ResponseWriter, model string) bool {
+	if h.Cfg == nil || !h.Cfg.StrictModelCheck || model == "" {
+		return false
+	}
+	if h.catalogHas(context.Background(), model) {
+		return false
+	}
+	// 文案里用客户端原本写的名字（resolveModel 可能补过 imodel/ 前缀，回显前缀
+	// 会让用户以为是自己的模型名写错了）。
+	writeErr(w, http.StatusNotFound,
+		"上游没有模型 "+strings.TrimPrefix(model, "imodel/")+"；可用模型见 GET /v1/models",
+		"not_found_error")
+	return true
+}
+
+// rejectDeadModel 模型处于「已下架」台账内就直接回 404（OpenAI 形态），不打上游。
+// 返回 true 表示已经写过响应。
+func (h *Handler) rejectDeadModel(w http.ResponseWriter, model string) bool {
+	if h.Pool == nil || !h.Pool.ModelDead(model) {
+		return false
+	}
+	writeErr(w, http.StatusNotFound, deadModelMessage(model), "not_found_error")
+	return true
 }
 
 // rejectImageModel 图像模型被当对话模型用时的 400（OpenAI 形态）。

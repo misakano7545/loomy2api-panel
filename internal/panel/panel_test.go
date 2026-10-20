@@ -546,6 +546,15 @@ func TestCheckinAccountUpstreamError(t *testing.T) {
 func TestCheckinAll(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 新手任务全已完成：签到链路里的自动领取只发一次 GET、不领分、不再刷额度，
+		// 这样 first-login 的调用次数仍能精确断言。
+		if strings.Contains(r.URL.Path, "onboarding/tasks") {
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"tasks":{
+				"first_message":true,"pick_skill":true,"generate_ppt":true,"set_schedule":true,
+				"install_skill":true,"configure_remote":true,"create_soul":true,"share_soul":true},
+				"earned":10000,"total":10000}}`)
+			return
+		}
 		if strings.Contains(r.URL.Path, "first-login") {
 			hits++
 			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyProcessed":true,
@@ -581,5 +590,297 @@ func TestCheckinAll(t *testing.T) {
 	item, _ := results[0].(map[string]any)
 	if item["name"] != "acc1" || item["ok"] != true || item["granted"] != false {
 		t.Errorf("结果项不对: %v", item)
+	}
+}
+
+// TestSetRemarkPersistsToAccountFile 备注必须落到 auths/<账号>.json 并随 overview 下发：
+// 这是「换浏览器 / 换入口还看得见」的唯一保证，也是从 localStorage 迁到后端的核心诉求。
+func TestSetRemarkPersistsToAccountFile(t *testing.T) {
+	pl, p := newTestPanelFull(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/remark",
+		strings.NewReader(`{"remark":"主力号"}`))
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+
+	// 1) 内存里的账号对象立即生效
+	if got := p.Get("acc1").Remark; got != "主力号" {
+		t.Fatalf("内存备注 = %q", got)
+	}
+	// 2) 落盘：直接读文件，不依赖进程内状态
+	path := filepath.Join(pl.cfg.Resolve(pl.cfg.AuthDir), "acc1.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读账号文件失败：%v", err)
+	}
+	var onDisk map[string]any
+	if err := json.Unmarshal(raw, &onDisk); err != nil {
+		t.Fatalf("账号文件不是合法 JSON：%v", err)
+	}
+	if onDisk["remark"] != "主力号" {
+		t.Fatalf("账号文件 remark = %v", onDisk["remark"])
+	}
+	// 3) 重启后仍在：按落盘内容重建一份池
+	loaded, err := pool.LoadAccounts(pl.cfg.Resolve(pl.cfg.AuthDir))
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("重新加载失败：%v / %d 个", err, len(loaded))
+	}
+	if loaded[0].Remark != "主力号" {
+		t.Fatalf("重新加载后备注 = %q", loaded[0].Remark)
+	}
+	// 4) overview 下发给前端（前端只认这个字段）
+	ov := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
+	ow := httptest.NewRecorder()
+	pl.ServeHTTP(ow, ov)
+	if !strings.Contains(ow.Body.String(), `"remark":"主力号"`) {
+		t.Errorf("overview 未下发 remark：%s", ow.Body.String())
+	}
+}
+
+// TestRemarkSurvivesQuotaRefresh 回归：SaveAccount 是「快照整体覆盖」，
+// 每次刷新额度都会 persist 一次。备注若没进 persisted()，会被静默冲掉。
+func TestRemarkSurvivesQuotaRefresh(t *testing.T) {
+	pl, p := newTestPanelFull(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	acc := p.Get("acc1")
+	acc.Remark = "别丢"
+	pl.persist(acc)
+
+	// 模拟刷新额度后的再次落盘（清掉其它字段、只走 persisted 快照）。
+	bal := int64(7777)
+	acc.Available = &bal
+	pl.persist(acc)
+
+	dir := pl.cfg.Resolve(pl.cfg.AuthDir)
+	loaded, err := pool.LoadAccounts(dir)
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("重新加载失败：%v", err)
+	}
+	if loaded[0].Remark != "别丢" {
+		t.Fatalf("额度刷新后备注被冲掉了：%q", loaded[0].Remark)
+	}
+	if loaded[0].Available == nil || *loaded[0].Available != 7777 {
+		t.Errorf("额度刷新未落盘：%+v", loaded[0].Available)
+	}
+}
+
+// TestSetRemarkClearsAndValidates 空串 = 清除（文件里不留空键）；超长 400 且不改动已有值。
+func TestSetRemarkClearsAndValidates(t *testing.T) {
+	pl, p := newTestPanelFull(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	acc := p.Get("acc1")
+	acc.Remark = "旧备注"
+	pl.persist(acc)
+
+	tooLong := strings.Repeat("字", 30)
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/remark",
+		strings.NewReader(`{"remark":"`+tooLong+`"}`))
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("超长应 400，实际 %d", w.Code)
+	}
+	if acc.Remark != "旧备注" {
+		t.Errorf("被拒绝的请求不该改动备注：%q", acc.Remark)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/remark",
+		strings.NewReader(`{"remark":"  "}`))
+	w = httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("清除应 200，实际 %d：%s", w.Code, w.Body.String())
+	}
+	if acc.Remark != "" {
+		t.Errorf("空白应清除备注，实际 %q", acc.Remark)
+	}
+	raw, err := os.ReadFile(filepath.Join(pl.cfg.Resolve(pl.cfg.AuthDir), "acc1.json"))
+	if err != nil {
+		t.Fatalf("读账号文件失败：%v", err)
+	}
+	if strings.Contains(string(raw), `"remark"`) {
+		t.Errorf("清除后不应留下空 remark 键：%s", raw)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/panel/api/accounts/nope/remark",
+		strings.NewReader(`{"remark":"x"}`))
+	w = httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Errorf("不存在的账号应 404，实际 %d", w.Code)
+	}
+}
+
+// TestOnboardingEndpoint 面板单号领取：返回本次领到的任务与积分，并把额度快照刷新。
+func TestOnboardingEndpoint(t *testing.T) {
+	var completes int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/onboarding/tasks"):
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"tasks":{
+				"first_message":false,"pick_skill":false,"generate_ppt":false,"set_schedule":false,
+				"install_skill":false,"configure_remote":false,"create_soul":false,"share_soul":false}}}`)
+		case strings.HasSuffix(r.URL.Path, "/onboarding/tasks/complete"):
+			completes++
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyCompleted":false,"balance":15000}}`)
+		case strings.Contains(r.URL.Path, "points/records"):
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"balance":5000,"dailyBalance":5000,"availableBalance":20000}}`)
+		default:
+			_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+		}
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/onboarding", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	var out struct {
+		Onboarding struct {
+			Claimed []string `json:"claimed"`
+			Points  int64    `json:"points"`
+			Total   int64    `json:"total"`
+		} `json:"onboarding"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(out.Onboarding.Claimed) != 8 || out.Onboarding.Points != 10000 {
+		t.Errorf("应领满 8 个任务 / 10000 积分，实际 %d / %d", len(out.Onboarding.Claimed), out.Onboarding.Points)
+	}
+	if out.Onboarding.Total != 10000 {
+		t.Errorf("total = %d", out.Onboarding.Total)
+	}
+	if completes != 8 {
+		t.Errorf("complete 调用 %d 次，期望 8", completes)
+	}
+	_ = p
+}
+
+// TestOnboardingAllSkipsInvalid 全量领取跳过禁用 / 登录态失效的账号。
+func TestOnboardingAllSkipsInvalid(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/onboarding/tasks") {
+			got = append(got, r.Header.Get("Authorization"))
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"tasks":{}}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	p.Add(&pool.Account{Name: "dead", Enabled: true, Session: "s-dead",
+		ExpireAt: time.Now().Add(-time.Hour).Unix()})
+	p.Add(&pool.Account{Name: "off", Enabled: false, Session: "s-off",
+		ExpireAt: time.Now().Add(72 * time.Hour).Unix()})
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/onboarding_all", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d：%s", w.Code, w.Body.String())
+	}
+	if len(got) != 1 || !strings.Contains(got[0], "sess-1") {
+		t.Errorf("只该查一次目录（acc1 的会话），实际 %v", got)
+	}
+}
+
+// TestDeadModelsGloballyHidden 404 之后：模型进台账、/v1/models 与面板模型视图都不再列它，
+// 再请求它直接 404 且不打上游。
+func TestDeadModelsGloballyHidden(t *testing.T) {
+	var chatHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/models"):
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"gone-model","type":"chat"},{"id":"spark-x","type":"chat"}]}`)
+		case strings.Contains(r.URL.Path, "chat/completions"):
+			chatHits++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"code":404,"message":"该模型暂未开放，请切换其他模型"}}`)
+		default:
+			_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+		}
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	if _, err := p.Acquire(nil, "gone-model", ""); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟一次上游 404（走真实 ReportFailure 路径）
+	acc := p.Get("acc1")
+	p.ReportFailure(acc, 404, `{"error":{"code":404,"message":"该模型暂未开放"}}`, "", "gone-model")
+
+	if !p.ModelDead("gone-model") {
+		t.Fatal("404 后模型应进台账")
+	}
+	if acc.InCooldown() {
+		t.Error("404 不该冷却账号")
+	}
+
+	// 面板模型视图
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/models", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	var ml struct {
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &ml); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, m := range ml.Models {
+		ids[m.ID] = true
+	}
+	if ids["gone-model"] {
+		t.Errorf("已下架模型不该出现在模型列表：%v", ids)
+	}
+	if !ids["spark-x"] {
+		t.Errorf("其它模型应照常列出：%v", ids)
+	}
+
+	// 台账接口 + 手动解封
+	req = httptest.NewRequest(http.MethodGet, "/panel/api/dead_models", nil)
+	w = httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "gone-model") {
+		t.Errorf("台账应列出该模型：%s", w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/panel/api/dead_models/gone-model/clear", nil)
+	w = httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if p.ModelDead("gone-model") {
+		t.Error("手动解封后应不再判失效")
+	}
+	_ = chatHits
+}
+
+// TestOverviewExposesDeadModels overview 要带上台账与选号口径，面板据此渲染。
+func TestOverviewExposesDeadModels(t *testing.T) {
+	pl, p := newTestPanelFull(t, "http://127.0.0.1:1", "http://127.0.0.1:1")
+	p.MarkModelDead("gone-model", "该模型暂未开放")
+
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "gone-model") {
+		t.Errorf("overview 应带 dead_models：%s", body)
+	}
+	if !strings.Contains(body, "prefer_daily_quota") {
+		t.Errorf("overview 应带 prefer_daily_quota：%s", body)
 	}
 }

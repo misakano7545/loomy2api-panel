@@ -2,6 +2,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,7 +17,7 @@ const (
 	FaultQuota            // 额度/积分耗尽 → 硬冷却
 	FaultModelLimit       // 模型级限流 → 只锁该模型
 	FaultRateLimit        // 频控 → 软冷却
-	FaultNotFound         // 404 → 短冷却
+	FaultNotFound         // 404 → 模型级失效台账（不罚账号，见 deadmodel.go）
 	FaultSession          // 登录态失效 → 需重登
 	FaultServer           // 5xx → 喂熔断
 	FaultClient           // 客户端问题 → 不罚账号
@@ -114,14 +115,38 @@ func ResetAtFromBody(body string) float64 {
 	return 0
 }
 
-// NextDailyReset 明日本地 04:00 的时间戳（额度耗尽硬冷却兜底）。
+// NextDailyReset 次日 00:00 的时间戳（额度耗尽硬冷却终点）。
+//
+// ⚠️ 是**自然日 24:00**，不是本地 04:00：上游的每日赠送额度按自然日重置
+// （实测 0 点后就能继续用），按 04:00 冷却会让 23:50 烧空额度的账号白等到次日
+// 04:00 —— 白丢 4 小时可用时间。这个口径来自 dsh-providers-hub 对同一个上游的
+// 实测结论（Gitee IKL80H），与 WorkBuddy 的 04:00 只是巧合、不可互抄。
 func NextDailyReset() float64 {
 	now := time.Now()
-	t := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
-	if !t.After(now) {
-		t = t.Add(24 * time.Hour)
+	return float64(time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).
+		AddDate(0, 0, 1).Unix())
+}
+
+// FaultMessage 从上游错误体里取一句人能读的原因（台账 / 面板展示用）。
+//
+// 直接存整段 body 会把 "{\"error\":{\"code\":404,...}}" 原样塞进面板台账里，
+// 既难认也没必要；取不到就退回截断的原文，至少不丢信息。
+func FaultMessage(body string) string {
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Desc    string `json:"desc"`
+		Message string `json:"message"`
 	}
-	return float64(t.Unix())
+	if err := json.Unmarshal([]byte(body), &env); err == nil {
+		for _, s := range []string{env.Error.Message, env.Desc, env.Message} {
+			if s != "" {
+				return s
+			}
+		}
+	}
+	return truncate(body, 120)
 }
 
 // AccountFault 该分类是否算「账号自身的问题」（换号可能有效）。
@@ -133,9 +158,13 @@ func AccountFault(f Fault) bool {
 	return false
 }
 
-// FatalRequest 该分类是否不该换号重试（客户端请求本身有问题）。
+// FatalRequest 该分类不该换号重试。
+//
+// 两类都算：客户端请求本身有问题（FaultClient），以及**换号也不会好**的
+// 模型级 404（FaultNotFound）。后者尤其要停：旧实现把 404 当账号故障去罚账号
+// 并换下一个号，一个打错模型名的请求会接连冻掉池里所有账号，最后还是 404。
 func FatalRequest(f Fault) bool {
-	return f == FaultClient
+	return f == FaultClient || f == FaultNotFound
 }
 
 // StatusFromBody 尽力从上游错误体里取 HTTP 状态（有些网关把状态塞进 body）。

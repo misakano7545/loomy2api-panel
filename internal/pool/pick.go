@@ -58,6 +58,53 @@ func successWeight(a *Account) float64 {
 	return float64(a.Requests) / float64(total) * WSuccess
 }
 
+// pickTier 账号的积分档位（越小越优先）。0 = 今日赠送额度可用；
+// 1 = 只剩永久积分；2 = 其余（余额未知 / 查询失败 / 两头都空）。
+//
+// ⚠️ 余额未知**必须垫底**而不是排最前：宁可先用能确认余额的号，也不要把流量
+// 押在一个连额度都没查到的号上（dsh-providers-hub 的同类选择器把「查询失败」
+// 显式归最后一档，理由一致）。
+func pickTier(a *Account) int {
+	if a.DailyBalance != nil && *a.DailyBalance > 0 {
+		return 0
+	}
+	perm := a.Permanent
+	if perm == nil {
+		perm = a.Balance
+	}
+	if perm != nil && *perm > 0 {
+		return 1
+	}
+	return 2
+}
+
+// preferDailyTier 只保留最优档位的候选（档内顺序不变，交给后面的加权抽签）。
+//
+// 上游每日赠送按自然日清零、永久积分不过期，所以「先花今天会作废的」是严格的
+// 经济上占优；上游又不会因赠送额度耗尽而报错（静默改扣永久积分并照常 200），
+// 这件事只能在这里做。
+func preferDailyTier(cands []*Account) []*Account {
+	if len(cands) <= 1 {
+		return cands
+	}
+	best := 2
+	for _, a := range cands {
+		if t := pickTier(a); t < best {
+			best = t
+		}
+	}
+	if best == 2 {
+		return cands // 全员未知/无余额：不分层，保持原行为
+	}
+	out := make([]*Account, 0, len(cands))
+	for _, a := range cands {
+		if pickTier(a) == best {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // pickWeighted Top-N 短名单 + 加权随机抽签。
 //
 // 为何先截断再抽签：直接对全体加权随机，低权重账号仍有概率被抽中；

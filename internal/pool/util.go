@@ -79,6 +79,23 @@ func int64Of(vals ...any) int64 {
 	return 0
 }
 
+// numOf 取浮点数值（state.json 读回来是 float64；兼容字符串与整型）。
+func numOf(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case int64:
+		return float64(t)
+	case int:
+		return float64(t)
+	case string:
+		if f, err := strconv.ParseFloat(t, 64); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
 func toBool(v any) bool {
 	switch t := v.(type) {
 	case bool:

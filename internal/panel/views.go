@@ -10,9 +10,11 @@ package panel
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -291,6 +293,46 @@ func (p *Panel) togglePause(w http.ResponseWriter, r *http.Request, paused bool)
 		verb = "恢复选号"
 	}
 	p.Logf("账号 %s 已%s", name, verb)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+// ---------------------------------------------------------------- 账号备注
+
+// remarkMaxLen 备注长度上限（rune）。面板输入框 maxlength=24，后端再挡一道：
+// 这个值会落进 auths/<账号>.json 并被渲染到账号池 / 用量 / 积分构成三个视图。
+const remarkMaxLen = 24
+
+// setRemark POST /panel/api/accounts/{name}/remark，body {"remark":"…"}。
+//
+// 备注存在账号文件（auths/<账号>.json 的 remark 键）里，跟着账号一起备份/迁移，
+// 不再像早期版本那样只留在浏览器 localStorage（换浏览器、换入口、清站点数据即丢）。
+// 空串表示清除：persisted() 对空值是「不写键」，所以清除后文件里不会留空字段。
+func (p *Panel) setRemark(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
+		return
+	}
+	var body struct {
+		Remark string `json:"remark"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	remark := strings.TrimSpace(body.Remark)
+	if n := len([]rune(remark)); n > remarkMaxLen {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("备注最长 %d 个字符（当前 %d）", remarkMaxLen, n))
+		return
+	}
+	acc.Remark = remark
+	p.persist(acc)
+	verb := "已设置备注"
+	if remark == "" {
+		verb = "已清除备注"
+	}
+	p.Logf("账号 %s %s", name, verb)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 

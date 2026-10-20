@@ -951,3 +951,83 @@ func TestChatPathDoesNotFetchCatalog(t *testing.T) {
 		}
 	}
 }
+
+// TestUnknownModelRejectedBeforeUpstream 回归（实机踩到的真事故）：Loomy 对**认不出
+// 的模型名**不报错，而是静默用默认模型执行并回 200（实测 `no-such-model-xyz` →
+// `"model":"DeepSeek-V4.1-Flash"`，按默认模型扣分）。客户端会拿到一个"成功"的
+// 错答案、账单也对不上，所以网关必须在目录层面直接 404，且不打上游。
+func TestUnknownModelRejectedBeforeUpstream(t *testing.T) {
+	fs := imageCatalogUpstream(t)
+	h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 3 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+	before := len(fs.seen)
+
+	for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
+		var body string
+		if path == "/v1/responses" {
+			body = `{"model":"no-such-model-xyz","input":"hi"}`
+		} else {
+			body = `{"model":"no-such-model-xyz","messages":[{"role":"user","content":"hi"}]}`
+		}
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s 未知模型应 404，实际 %d：%s", path, w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "/v1/models") {
+			t.Errorf("错误文案应指路 /v1/models：%s", w.Body.String())
+		}
+	}
+
+	if len(fs.seen) != before {
+		t.Errorf("未知模型不该打上游：多出 %d 次", len(fs.seen)-before)
+	}
+	for _, a := range p.All() {
+		if a.InCooldown() {
+			t.Errorf("未知模型不该冷却账号 %s", a.Name)
+		}
+		if a.Failures != 0 {
+			t.Errorf("未知模型不该计入失败数 %s：%d", a.Name, a.Failures)
+		}
+	}
+}
+
+// TestKnownModelStillPassesStrictCheck 目录里的模型（含 imodel/ 前缀与大小写差异）
+// 不能被严校验误伤。
+func TestKnownModelStillPassesStrictCheck(t *testing.T) {
+	for _, model := range []string{"DeepSeek-V4.1-Flash", "deepseek-v4.1-flash", "imodel/DeepSeek-V4.1-Flash"} {
+		fs := imageCatalogUpstream(t)
+		h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+		if list := h.Models.Get(context.Background(), "sess"); len(list) != 3 {
+			t.Fatalf("目录预热失败")
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hi"}]}`))
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("模型 %s 应放行，实际 %d：%s", model, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestStrictCheckOffAllowsUnknown 关掉开关后回到旧行为（未知模型照发上游）：
+// 上游如果新上了模型、目录还没刷新，用户可临时关掉校验自救。
+func TestStrictCheckOffAllowsUnknown(t *testing.T) {
+	fs := imageCatalogUpstream(t)
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	h.Cfg.StrictModelCheck = false
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 3 {
+		t.Fatalf("目录预热失败")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"brand-new-model","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("关闭严校验后应放行，实际 %d：%s", w.Code, w.Body.String())
+	}
+}

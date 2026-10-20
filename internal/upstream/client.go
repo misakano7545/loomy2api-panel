@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -578,6 +579,120 @@ func (c *Client) Checkin(ctx context.Context, session string) (*CheckinResult, e
 		RefreshedAt: time.Now().Unix(),
 	}
 	return res, nil
+}
+
+// ---------------------------------------------------------------- 新手任务
+
+// OnboardingPoints 新手任务 key → 积分（合计 10000）。
+//
+// 来源：Loomy 客户端内置的 TASK_POINTS 表（8 项之和 = 10000）。服务端响应里的
+// earned 是**累计已领**、不是本次增量，且官方客户端自己也按本地表现算，
+// 所以这里一律按表计分，不采信响应体的数字（只采信 alreadyCompleted 判幂等）。
+var OnboardingPoints = map[string]int64{
+	"first_message":    500,
+	"pick_skill":       1000,
+	"generate_ppt":     1500,
+	"set_schedule":     1000,
+	"install_skill":    1500,
+	"configure_remote": 1000,
+	"create_soul":      1500,
+	"share_soul":       2000,
+}
+
+// OnboardingTitles 任务 key 的中文标题（面板展示用）。
+var OnboardingTitles = map[string]string{
+	"first_message":    "发送你的第一条消息",
+	"pick_skill":       "试试选择一个技能",
+	"generate_ppt":     "生成第一份 PPT",
+	"set_schedule":     "设置定时任务",
+	"install_skill":    "在技能广场安装一个技能",
+	"configure_remote": "配置远程控制",
+	"create_soul":      "创建你的第一个搭子",
+	"share_soul":       "把搭子分享给朋友",
+}
+
+// OnboardingTotal 全部新手任务积分合计。
+const OnboardingTotal int64 = 10000
+
+// OnboardingTasks GET /onboarding/tasks：8 个任务的完成状态。
+//
+// 返回的 tasks 已按本地表归一（缺的补 false、服务端多给的忽略），earned 按本地
+// 表现算 —— 这样面板与「本次领了多少」永远自洽。
+func (c *Client) OnboardingTasks(ctx context.Context, session string) (map[string]bool, int64, error) {
+	obj, status, err := c.GetJSON(ctx, "onboarding/tasks", session)
+	if err != nil {
+		return nil, 0, err
+	}
+	if status != 200 {
+		return nil, 0, fmt.Errorf("/onboarding/tasks HTTP %d", status)
+	}
+	data := mapOfAny(obj["data"])
+	if data == nil {
+		data = obj
+	}
+	raw, _ := data["tasks"].(map[string]any)
+	tasks := make(map[string]bool, len(OnboardingPoints))
+	var earned int64
+	for key := range OnboardingPoints {
+		done := false
+		if raw != nil {
+			done = boolOf(raw[key])
+		}
+		tasks[key] = done
+		if done {
+			earned += OnboardingPoints[key]
+		}
+	}
+	return tasks, earned, nil
+}
+
+// OnboardingComplete POST /onboarding/tasks/complete，body 只有 {"key":...}。
+//
+// 服务端**不校验前置行为**（实测：不真的发对话/生成 PPT 也能拿满 10000），
+// 且幂等判据是响应体的 alreadyCompleted —— 不是 HTTP 码、不是信封里的 code。
+// 返回 already=true 表示此前已完成（本次没加分）。
+func (c *Client) OnboardingComplete(ctx context.Context, session, key string) (already bool, balance int64, err error) {
+	obj, status, err := c.PostJSON(ctx, "onboarding/tasks/complete", session,
+		map[string]any{"key": key}, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	if status != 200 {
+		return false, 0, fmt.Errorf("/onboarding/tasks/complete HTTP %d", status)
+	}
+	data := mapOfAny(obj["data"])
+	if data == nil {
+		data = obj
+	}
+	return boolOf(data["alreadyCompleted"]), int64(num(data["balance"])), nil
+}
+
+// ClaimOnboarding 领完所有未完成的新手任务，返回本次新领的任务与积分。
+//
+// 先 GET 一次状态，只对未完成的 key 发 complete —— 已完成的重复 POST 虽然幂等，
+// 但每次 8 个请求没必要（这个方法会被签到链路定期调到）。
+func (c *Client) ClaimOnboarding(ctx context.Context, session string) (claimed []string, points int64, err error) {
+	tasks, _, err := c.OnboardingTasks(ctx, session)
+	if err != nil {
+		return nil, 0, err
+	}
+	for key, done := range tasks {
+		if done {
+			continue
+		}
+		already, _, cerr := c.OnboardingComplete(ctx, session, key)
+		if cerr != nil {
+			// 单个任务失败不放弃其余：8 个任务各自独立结算。
+			continue
+		}
+		if already {
+			continue
+		}
+		claimed = append(claimed, key)
+		points += OnboardingPoints[key]
+	}
+	sort.Strings(claimed)
+	return claimed, points, nil
 }
 
 // Search 内置联网检索（腾讯搜索通道）。

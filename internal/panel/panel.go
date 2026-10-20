@@ -90,9 +90,14 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/disable", p.withAuth(p.disableAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/revive", p.withAuth(p.reviveAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/remove", p.withAuth(p.removeAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/remark", p.withAuth(p.setRemark))
 
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.refreshAll))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/onboarding", p.withAuth(p.onboardingAccount))
+	p.mux.HandleFunc("POST /panel/api/onboarding_all", p.withAuth(p.onboardingAll))
+	p.mux.HandleFunc("GET /panel/api/dead_models", p.withAuth(p.deadModelsHandler))
+	p.mux.HandleFunc("POST /panel/api/dead_models/{model}/clear", p.withAuth(p.clearDeadModel))
 
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsHandler))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageHandler))
@@ -138,6 +143,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	ov["sticky_sessions"] = p.pool.Sticky().Snapshot()["entries"]
 	ov["uptime_sec"] = int(time.Since(p.started).Seconds())
 	ov["model_locks"] = p.pool.ModelLockView()
+	ov["dead_models"] = p.pool.DeadModels()
+	ov["prefer_daily_quota"] = p.cfg.PreferDaily
 	ov["accounts"] = p.accountRows()
 
 	windows := map[string]int64{"24h": 86400, "today": todaySeconds(), "3d": 3 * 86400, "7d": 7 * 86400, "30d": 30 * 86400}
@@ -177,7 +184,14 @@ func (p *Panel) accountRows() []map[string]any {
 
 func (p *Panel) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	list := p.models.Get(r.Context(), p.anySession())
-	writeJSON(w, http.StatusOK, map[string]any{"models": list})
+	// 已判定下架的模型不进列表：它们在面板里点不出可用请求，只会在「不可用」区块出现。
+	kept := list[:0]
+	for _, m := range list {
+		if !p.pool.ModelDead(m.ID) {
+			kept = append(kept, m)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"models": kept, "dead_models": p.pool.DeadModels()})
 }
 
 func (p *Panel) usageHandler(w http.ResponseWriter, r *http.Request) {
@@ -477,7 +491,128 @@ func (p *Panel) doCheckinCtx(ctx context.Context, acc *pool.Account) (*upstream.
 	}
 	p.Logf("账号 %s 签到：%s（每日 %d/%d，长期 %d，可用 %d）", acc.Name,
 		verb, res.DailyQuota-res.DailyConsumed, res.DailyQuota, res.PermanentBalance, res.CurrentBalance)
+	// 顺带领新手任务（合计 10000 积分，零 token 消耗）：服务端不校验前置行为，
+	// 已领过的号只多一次 GET（ClaimOnboarding 先查状态再补发）。登录 / 签到 /
+	// 定时刷额度都会走到这里，新号因此不需要手动点一次「领新手任务」。
+	if _, pts, oerr := p.claimOnboardingCtx(ctx, acc); oerr == nil && pts > 0 {
+		p.Logf("账号 %s 新手任务到账 %d 积分", acc.Name, pts)
+	}
 	return res, nil
+}
+
+// ---------------------------------------------------------------- 新手任务
+
+// onboardingAccount POST /panel/api/accounts/{name}/onboarding：领该号的新手任务。
+func (p *Panel) onboardingAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	claimed, points, err := p.claimOnboardingCtx(ctx, acc)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "account": acc.Public(),
+		"onboarding": map[string]any{
+			"claimed": claimed, "points": points,
+			"total": upstream.OnboardingTotal,
+		},
+	})
+}
+
+// onboardingAll POST /panel/api/onboarding_all：全池领新手任务。
+func (p *Panel) onboardingAll(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	defer cancel()
+
+	type result struct {
+		Name    string   `json:"name"`
+		OK      bool     `json:"ok"`
+		Claimed []string `json:"claimed,omitempty"`
+		Points  int64    `json:"points"`
+		Error   string   `json:"error,omitempty"`
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	var mu sync.Mutex
+	var results []result
+
+	for _, a := range p.pool.All() {
+		if !a.Enabled || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			claimed, points, err := p.claimOnboardingCtx(ctx, a)
+			mu.Lock()
+			defer mu.Unlock()
+			item := result{Name: a.Name, OK: err == nil, Claimed: claimed, Points: points}
+			if err != nil {
+				item.Error = err.Error()
+			}
+			results = append(results, item)
+		}(a)
+	}
+	wg.Wait()
+	var sum int64
+	for _, res := range results {
+		sum += res.Points
+	}
+	p.Logf("全量领新手任务：%d 个账号，共 %d 积分", len(results), sum)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "results": results, "points": sum, "overview": p.pool.Overview(),
+	})
+}
+
+// claimOnboardingCtx 领该号所有未完成的新手任务，领到积分后刷新额度快照。
+//
+// 服务端不校验前置行为（实测不真的发对话/生成 PPT 也能拿满 10000），所以这是
+// 纯 API 直领、零 token 消耗；幂等判据是响应体的 alreadyCompleted。
+func (p *Panel) claimOnboardingCtx(ctx context.Context, acc *pool.Account) ([]string, int64, error) {
+	if !acc.SessionValid() {
+		return nil, 0, fmt.Errorf("登录态已失效，需要重新登录")
+	}
+	claimed, points, err := p.upstream.ClaimOnboarding(ctx, acc.Session)
+	if err != nil {
+		return nil, 0, err
+	}
+	if points > 0 {
+		p.Logf("账号 %s 领新手任务：%d 个（%s），共 %d 积分",
+			acc.Name, len(claimed), strings.Join(claimed, ","), points)
+		// 积分变了：刷一次额度快照，面板立刻能看出 +10000（失败不影响领取结果）。
+		if qerr := p.refreshQuotaCtx(ctx, acc); qerr == nil {
+			p.persist(acc)
+		}
+	}
+	return claimed, points, nil
+}
+
+// ---------------------------------------------------------------- 已下架模型
+
+// deadModelsHandler GET /panel/api/dead_models：404 台账（模型级，与账号无关）。
+func (p *Panel) deadModelsHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"models":   p.pool.DeadModels(),
+		"ttl_days": p.cfg.DeadModelTTLDays,
+	})
+}
+
+// clearDeadModel POST /panel/api/dead_models/{model}/clear：手动解封一个模型。
+func (p *Panel) clearDeadModel(w http.ResponseWriter, r *http.Request) {
+	model := r.PathValue("model")
+	if p.pool.ClearDeadModel(model) {
+		p.Logf("模型 %s 已从「不可用」台账移除", model)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": p.pool.DeadModels()})
 }
 
 func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -692,6 +827,8 @@ func poolOptions(cfg *config.Config) pool.Options {
 		BreakerMax:       float64(cfg.BreakerMaxSeconds),
 		StickyTTL:        float64(cfg.StickyTTLSeconds),
 		StickyMaxEntries: cfg.StickyMaxEntries,
+		PreferDaily:      cfg.PreferDaily,
+		DeadModelTTL:     time.Duration(cfg.DeadModelTTLDays) * 24 * time.Hour,
 	}
 }
 

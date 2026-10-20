@@ -739,6 +739,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
+          <button class="xs" id="btnOnboardingAll" title="领新手任务：8 项合计 10000 积分，服务端不校验前置行为，零 token 消耗">领新手任务</button>
           <button class="xs" id="btnRefreshAll">全部刷新额度</button>
         </header>
         <div class="tbl-wrap">
@@ -768,6 +769,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
           </tr></thead>
           <tbody id="mlBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <!-- 已下架模型：上游对它们回 404「该模型暂未开放」。这类失败与账号无关（换号不会好），
+           所以不进账号冷却，只记在这里并从模型列表隐藏，等 TTL 到期或手动解封。 -->
+      <div class="box">
+        <header>
+          <h3>已下架模型 <span class="hint">上游 404 判定的失效模型，期间从模型列表隐藏、请求直接 404</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="dmNote"></span>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>模型</th><th>404 次数</th><th>原因</th><th>记录时间</th><th>到期</th><th></th>
+          </tr></thead>
+          <tbody id="dmBody"></tbody>
         </table>
         </div>
       </div>
@@ -1228,12 +1247,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
-<!-- 账号备注：只写本机 localStorage，不写回服务器；账号池与用量两个视图同步显示 -->
+<!-- 账号备注：落盘到 auths/<账号>.json（remark 键）；账号池与用量两个视图同步显示 -->
 <div class="veil" id="remarkVeil">
   <div class="dlg" style="width:560px">
     <header>
       <h3>账号备注</h3>
-      <div class="hint">备注只存在本机浏览器（localStorage: loomy2api.remarks.v1），不写回后端；账号池与用量页会同时显示「备注 + 原名称」。留空即清除该账号备注。</div>
+      <div class="hint">备注随账号保存到后端（<code>auths/&lt;账号&gt;.json</code> 的 <code>remark</code> 键），换浏览器 / 换设备 / 重新部署都还在；账号池与用量页会同时显示「备注 + 原名称」。留空即清除该账号备注，最长 24 字。</div>
     </header>
     <div class="body">
       <div class="rm-list" id="remarkBody"></div>

@@ -14,8 +14,7 @@
 
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'loomy2api.key', LS_THEME = 'loomy2api.theme';
-/* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
-const LS_REMARKS = 'loomy2api.remarks.v1';
+/* 账号备注的来源是后端（overview 每行的 remark 字段），这里只放内存索引。 */
 let remarksCache = null;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
@@ -446,6 +445,39 @@ function renderModelLocks(rows) {
   $('mlNote').textContent = list.length + ' 个模型受限';
 }
 
+// renderDeadModels 已下架模型（上游 404 台账）。与「模型锁池」互补：
+// 锁池是限流（等一会儿会好），这里是模型本身没了（换号、等冷却都不会好）。
+function renderDeadModels(rows) {
+  const tb = $('dmBody');
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="6" style="color:var(--ink-3)">没有模型被判失效</td></tr>';
+    $('dmNote').textContent = '';
+    return;
+  }
+  const now = Date.now();
+  tb.innerHTML = list.map(r => {
+    const left = (Number(r.until) * 1000 - now) / 1000;
+    return '<tr><td class="num">' + esc(r.model) + '</td>' +
+      '<td class="num">' + (r.hits || 0) + '</td>' +
+      '<td class="clip" title="' + esc(r.reason || '') + '">' + esc(r.reason || '—') + '</td>' +
+      '<td class="num">' + esc(r.seen_at ? fmtLocalDateTime(r.seen_at * 1000) : '—') + '</td>' +
+      '<td class="num">' + esc(r.until ? fmtLocalDateTime(r.until * 1000) + '（' + dur(left) + '）' : '—') + '</td>' +
+      '<td><button class="xs" data-dm="' + esc(r.model) + '">解除</button></td></tr>';
+  }).join('');
+  $('dmNote').textContent = list.length + ' 个模型不可用';
+  tb.querySelectorAll('button[data-dm]').forEach(btn => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api('dead_models/' + encodeURIComponent(btn.getAttribute('data-dm')) + '/clear', { method: 'POST' });
+        toast('已解除 ' + btn.getAttribute('data-dm'), 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+      finally { loadOverview(true); }
+    };
+  });
+}
+
 // renderExpiry 积分到期提醒（参考面板同区块）：Loomy 只有「每日赠送」会随周期失效，
 // 长期积分不到期。到期日 = daily_cycle_date 的次日 00:00；同一天的多个账号合并成一行。
 function renderExpiry(accounts) {
@@ -477,6 +509,8 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    // 备注索引跟着 overview 重建：它是后端下发字段的派生视图，不是本地真值。
+    remarksCache = null;
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
@@ -497,6 +531,7 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.total ? d.total + ' 个账号' : '';
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
+    renderDeadModels(d.dead_models);
   } catch (e) { if (!quiet) toast(e.message, 'err'); throw e; }
 }
 
@@ -556,6 +591,22 @@ $('btnCheckinAll').onclick = async () => {
     toast('全部签到完成：成功 ' + ok + '/' + rs.length + (granted ? '，其中 ' + granted + ' 个新领额度' : '（均为本周期已领）'), 'ok');
   } catch (e) { toast(e.message, 'err'); }
   finally { btn.disabled = false; loadOverview(true); }
+};
+$('btnOnboardingAll').onclick = async () => {
+  const btn = $('btnOnboardingAll');
+  btn.disabled = true; btn.textContent = '领取中…';
+  try {
+    const d = await api('onboarding_all', { method: 'POST' });
+    const rs = d.results || [];
+    const fail = rs.filter(r => !r.ok);
+    const pts = Number(d.points || 0);
+    toast(pts > 0
+      ? '新手任务：' + rs.length + ' 个账号共领 ' + fmtPoints(pts) + ' 积分'
+      : '新手任务：无可领取（' + rs.length + ' 个账号均已完成）',
+      pts > 0 ? 'ok' : 'ok');
+    if (fail.length) toast('其中 ' + fail.length + ' 个失败 — ' + fail[0].error, 'err');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '领新手任务'; loadOverview(true); }
 };
 $('btnRefreshAll').onclick = async () => {
   const btn = $('btnRefreshAll');
@@ -1921,14 +1972,19 @@ async function loadPackages(force) {
 // 当真值传进去，恒等于强刷。
 $('btnPk').onclick = () => loadPackages(true);
 
-/* ══ 账号备注（只写本机 localStorage；账号池 / 用量 / 积分构成视图共用同一份映射）══
-   展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身仍由服务端下发，不写回后端；
-   备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
+/* ══ 账号备注（存后端 auths/<账号>.json 的 remark 键；账号池 / 用量 / 积分构成共用）══
+   备注是纯展示信息，不参与选号 / 计费 / 鉴权，但**属于账号资料**：换浏览器、换入口
+   （127.0.0.1 与局域网 IP 是两个 origin）、清站点数据都不该丢，所以跟着账号文件走。
+   前端只在内存里按 name 建索引（remarksAll），真值一律以 overview 下发的 remark 为准。 */
 function remarksAll() {
   if (remarksCache) return remarksCache;
-  try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
-  catch (e) { remarksCache = {}; }
-  return remarksCache;
+  const map = {};
+  for (const s of (overviewData && overviewData.accounts) || []) {
+    const r = String(s.remark || '');
+    if (r) map[String(s.name || s.uid || '')] = r;
+  }
+  remarksCache = map;
+  return map;
 }
 function remarkOf(key) {
   key = String(key == null ? '' : key);
@@ -1939,10 +1995,8 @@ function remarkName(key, nameHtml) {
   const r = remarkOf(key);
   return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
 }
-function storeRemarks(map) {
-  remarksCache = map;
-  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
-}
+/* invalidateRemarks 只丢内存索引：真值在后端，重新拉 overview 就能拿回最新的。 */
+function invalidateRemarks() { remarksCache = null; }
 function remarkFormRows() {
   const rows = ((overviewData && overviewData.accounts) || [])
     .map(s => ({ uid: String(s.name || ''), who: s.name || '未命名' }))
@@ -1965,20 +2019,57 @@ function openRemarks() {
   $('remarkVeil').classList.add('on');
 }
 function closeRemarks() { $('remarkVeil').classList.remove('on'); }
-function saveRemarkForm() {
-  const map = {};
-  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
-    const v = inp.value.trim();
-    if (v) map[inp.getAttribute('data-uid')] = v;
-  });
-  storeRemarks(map);
+/* saveRemarkForm 只提交真正改动过的账号：一个号一条 POST，失败逐条报，
+   不让「其中一个写得进、另一个写不进」被一句「已保存」盖掉。 */
+async function saveRemarkForm() {
+  const prev = remarksAll();
+  const changed = Array.from(document.querySelectorAll('#remarkBody input[data-uid]'))
+    .map(inp => ({ name: inp.getAttribute('data-uid'), remark: inp.value.trim() }))
+    .filter(it => (prev[it.name] || '') !== it.remark);
+  if (!changed.length) { closeRemarks(); toast('备注无改动', 'ok'); return; }
+  const btn = $('btnRemarkSave');
+  btn.disabled = true;
+  const errs = [];
+  let ok = 0;
+  try {
+    for (const it of changed) {
+      try {
+        await api('accounts/' + encodeURIComponent(it.name) + '/remark',
+          { method: 'POST', body: JSON.stringify({ remark: it.remark }) });
+        ok++;
+      } catch (e) { errs.push(it.name + '：' + e.message); }
+    }
+  } finally { btn.disabled = false; }
+  invalidateRemarks();
   closeRemarks();
-  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
-  if (view === 'accounts') loadOverview(true);
-  else if (view === 'usage' && usageData) renderUsage(usageData);
-  toast('备注已保存（仅本机浏览器）');
+  // 备注已落盘到账号文件：必须重新拉 overview 才能拿到后端真值（本地不再缓存）。
+  await loadOverview(true);
+  if (view === 'usage' && usageData) renderUsage(usageData);
+  if (errs.length) toast('备注保存失败 ' + errs.length + ' 个 — ' + errs[0], 'err');
+  else toast('备注已保存（' + ok + ' 个账号）', 'ok');
 }
 $('btnRemarks').onclick = openRemarks;
 $('btnRemarkClose').onclick = closeRemarks;
-$('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+/* 「清空全部」= 把当前有备注的账号逐个置空（后端以空串表示清除），
+   而不是只清本地索引——否则刷新页面备注会全部回来。 */
+$('btnRemarkClear').onclick = async () => {
+  const names = Object.keys(remarksAll());
+  if (!names.length) { renderRemarkBody(); return; }
+  const btn = $('btnRemarkClear');
+  btn.disabled = true;
+  const errs = [];
+  try {
+    for (const name of names) {
+      try {
+        await api('accounts/' + encodeURIComponent(name) + '/remark',
+          { method: 'POST', body: JSON.stringify({ remark: '' }) });
+      } catch (e) { errs.push(name + '：' + e.message); }
+    }
+  } finally { btn.disabled = false; }
+  invalidateRemarks();
+  await loadOverview(true);
+  renderRemarkBody();
+  if (errs.length) toast('清除失败 ' + errs.length + ' 个 — ' + errs[0], 'err');
+  else toast('已清除全部备注', 'ok');
+};
 $('btnRemarkSave').onclick = saveRemarkForm;

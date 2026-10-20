@@ -614,3 +614,92 @@ func TestModelsParsesPromoFromName(t *testing.T) {
 		t.Errorf("type=%q 期望 image", img.Type)
 	}
 }
+
+// TestClaimOnboardingClaimsOnlyIncomplete 新手任务：只对未完成的 key 发 complete，
+// 积分按**本地表**现算（服务端 earned 是累计值、不可当增量），幂等判据是
+// alreadyCompleted（既不是 HTTP 码也不是信封 code）。
+func TestClaimOnboardingClaimsOnlyIncomplete(t *testing.T) {
+	var completed []string
+	var gotTasks, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/onboarding/tasks"):
+			_, _ = io.WriteString(w, `{"code":"000000","desc":"成功","data":{"tasks":{
+				"first_message":true,"pick_skill":false,"generate_ppt":false,"set_schedule":true,
+				"install_skill":true,"configure_remote":true,"create_soul":true,"share_soul":true},
+				"earned":8500,"total":10000}}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/onboarding/tasks/complete"):
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			var body map[string]any
+			_ = json.Unmarshal(b, &body)
+			completed = append(completed, body["key"].(string))
+			// alreadyCompleted=false 才算本次领到
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyCompleted":false,"balance":10000}}`)
+		default:
+			gotTasks = r.URL.Path
+			_, _ = io.WriteString(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	claimed, points, err := c.ClaimOnboarding(context.Background(), "sess")
+	if err != nil {
+		t.Fatalf("ClaimOnboarding: %v", err)
+	}
+	// 只有 pick_skill(1000) 与 generate_ppt(1500) 未完成
+	if len(claimed) != 2 || claimed[0] != "generate_ppt" || claimed[1] != "pick_skill" {
+		t.Fatalf("claimed = %v，期望 generate_ppt + pick_skill（已排序）", claimed)
+	}
+	if points != 2500 {
+		t.Errorf("积分 = %d，期望 2500（按本地表算，不采信服务端 earned）", points)
+	}
+	if len(completed) != 2 {
+		t.Errorf("应只对 2 个未完成任务发 complete，实际 %v", completed)
+	}
+	// 上报 body 只有 key（官方客户端也不带设备指纹 / 版本号）
+	if strings.Count(gotBody, ":") != 1 || !strings.Contains(gotBody, `"key"`) {
+		t.Errorf("complete 的 body 应只有 key 字段，实际 %s", gotBody)
+	}
+	_ = gotTasks
+}
+
+// TestOnboardingTasksNormalizes 目录归一：服务端多给的 key 忽略、缺的补 false，
+// earned 一律按本地表现算（不采信响应体）。
+func TestOnboardingTasksNormalizes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":"000000","data":{"tasks":{
+			"first_message":true,"unknown_task":true},"earned":99999,"total":10000}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	tasks, earned, err := c.OnboardingTasks(context.Background(), "sess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != len(OnboardingPoints) {
+		t.Errorf("任务数 = %d，期望 %d（按本地表归一）", len(tasks), len(OnboardingPoints))
+	}
+	if _, ok := tasks["unknown_task"]; ok {
+		t.Error("服务端多给的 key 应被忽略")
+	}
+	if !tasks["first_message"] || tasks["share_soul"] {
+		t.Errorf("完成状态解析错: %v", tasks)
+	}
+	if earned != OnboardingPoints["first_message"] {
+		t.Errorf("earned = %d，期望 %d（按本地表算）", earned, OnboardingPoints["first_message"])
+	}
+}
+
+// TestOnboardingPointsSum 本地积分表必须正好 10000（错一项就等于少领钱）。
+func TestOnboardingPointsSum(t *testing.T) {
+	var sum int64
+	for _, v := range OnboardingPoints {
+		sum += v
+	}
+	if sum != OnboardingTotal {
+		t.Fatalf("表内合计 = %d，期望 %d", sum, OnboardingTotal)
+	}
+}

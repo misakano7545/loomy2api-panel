@@ -28,6 +28,10 @@ type Options struct {
 	BreakerMax       float64
 	StickyTTL        float64
 	StickyMaxEntries int
+	// PreferDaily 选号时把「今日赠送额度 > 0」的账号放前面（见 pickTier）。
+	PreferDaily bool
+	// DeadModelTTL 404 模型失效记录的存活时长（0 = 用 DefaultDeadModelTTL）。
+	DeadModelTTL time.Duration
 }
 
 // DefaultOptions 返回一份默认参数。
@@ -67,6 +71,10 @@ type Pool struct {
 	pendingState map[string]map[string]any
 
 	pickSeq uint64
+
+	// dead 模型级「已下架」台账（见 deadmodel.go）：404 罚模型、不罚账号。
+	deadMu sync.Mutex
+	dead   map[string]*deadEntry
 
 	// onSave 落盘钩子（测试可替换）；nil 用默认文件写。
 	onSave func(map[string]any) error
@@ -309,6 +317,15 @@ func (p *Pool) Acquire(exclude []string, model string, sessionKey string) (*Acco
 		return nil, ErrNoAccount
 	}
 
+	// 每日赠送优先：把「今日额度 > 0」的号提到最前，只在其内部比权重。
+	//
+	// 为什么必须分层而不是揉进权重：上游的每日赠送额度**按自然日清零**，
+	// 永久积分不过期。平均加权会先烧永久积分、把每天会作废的赠送额度留到浪费。
+	// 上游不会因为赠送额度耗尽报错（继续扣永久、照常 200），所以只能靠选号侧排序。
+	if opts.PreferDaily {
+		candidates = preferDailyTier(candidates)
+	}
+
 	// 在途未满的优先
 	usable := make([]*Account, 0, len(candidates))
 	for _, a := range candidates {
@@ -387,6 +404,17 @@ func (p *Pool) ReportFailure(a *Account, status int, body, sessionKey, model str
 		return
 	}
 	opts := p.Options()
+	class := Classify(status, body)
+
+	// 404 = 模型不在上游目录（「该模型暂未开放」），是**模型**的问题，不是账号的：
+	// 换号、等冷却都不会好，罚账号还会让一个打错模型名的请求冻掉唯一可用号。
+	// 故记进模型级台账（/v1/models 会隐藏它）并**完全不碰账号**——连 Failures
+	// 都不加，否则 404 会污染该账号在所有模型上的成功率权重。
+	if class == FaultNotFound {
+		p.MarkModelDead(model, FaultMessage(body))
+		return
+	}
+
 	a.Failures++
 	a.SetLastError(fmt.Sprintf("http %d: %s", status, truncate(body, 160)))
 	p.dirty.Store(true)
@@ -394,17 +422,15 @@ func (p *Pool) ReportFailure(a *Account, status int, body, sessionKey, model str
 		p.Sticky().Unbind(sessionKey, a.Name)
 	}
 
-	switch class := Classify(status, body); class {
+	switch class {
 	case FaultQuota:
-		// 额度耗尽 → 硬冷却到明日额度重置（本地 04:00 兜底）
+		// 额度耗尽 → 硬冷却到次日 00:00（自然日重置，见 NextDailyReset）
 		a.CoolHard(NextDailyReset(), "额度耗尽")
 	case FaultModelLimit:
 		// 模型级限流：只锁该模型，换模型立即可用
 		a.CoolModel(model, opts.SoftRateBase, "模型级限流")
 	case FaultRateLimit:
 		a.CoolSoft(opts.SoftRateBase, opts.SoftRateMax, truncate(body, 120), ResetAtFromBody(body))
-	case FaultNotFound:
-		a.Cool(opts.NotFoundCool, CoolSoft, "404")
 	case FaultSession:
 		// 登录态失效：Loomy 没有 refresh token，只能重新登录。
 		// 一次失败不判死（可能是网络抖动），连败达阈值才禁用。
@@ -530,8 +556,9 @@ func (p *Pool) stateSnapshot() map[string]any {
 		}
 	}
 	return map[string]any{
-		"saved_at": time.Now().Unix(),
-		"accounts": accounts,
+		"saved_at":    time.Now().Unix(),
+		"accounts":    accounts,
+		"dead_models": p.deadSnapshot(),
 	}
 }
 
@@ -571,12 +598,14 @@ func (p *Pool) load() {
 		return
 	}
 	var snap struct {
-		Accounts map[string]map[string]any `json:"accounts"`
+		Accounts   map[string]map[string]any `json:"accounts"`
+		DeadModels map[string]map[string]any `json:"dead_models"`
 	}
 	if err := json.Unmarshal(raw, &snap); err != nil {
 		return
 	}
 	p.pendingState = snap.Accounts
+	p.restoreDead(snap.DeadModels)
 }
 
 // pendingState 账号文件先加载，再由 ApplyState 合并计数（避免相互覆盖）。

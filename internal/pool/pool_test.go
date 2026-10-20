@@ -1,6 +1,9 @@
 package pool
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -617,5 +620,38 @@ func TestQuotaSurvivesRestart(t *testing.T) {
 	}
 	if got.QuotaAt != 1792390000 {
 		t.Errorf("quota_updated_at 未恢复: %d", got.QuotaAt)
+	}
+}
+
+// TestRemarkSurvivesRestart 备注属于账号资料：落盘 → 重新加载必须原样回来。
+// 它与额度快照是同一条约束——persisted() 是「整体覆盖」，漏字段等于静默清零。
+func TestRemarkSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	a := &Account{
+		Name: "acc1", Enabled: true, Session: "s1",
+		Remark: "主力号（联通）",
+	}
+	if err := SaveAccount(dir, a); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	loaded, err := LoadAccounts(dir)
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("LoadAccounts: %v / %d", err, len(loaded))
+	}
+	if loaded[0].Remark != "主力号（联通）" {
+		t.Errorf("remark 未恢复: %q", loaded[0].Remark)
+	}
+
+	// 再存一次不带备注的（模拟清除）：文件里不能留下空键。
+	loaded[0].Remark = ""
+	if err := SaveAccount(dir, loaded[0]); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "acc1.json"))
+	if err != nil {
+		t.Fatalf("读文件: %v", err)
+	}
+	if strings.Contains(string(raw), `"remark"`) {
+		t.Errorf("清除后不应留下空 remark 键: %s", raw)
 	}
 }

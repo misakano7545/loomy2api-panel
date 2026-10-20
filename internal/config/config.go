@@ -117,11 +117,22 @@ type Config struct {
 	SessionRenewDays    int    `json:"session_renew_before_days"`
 	QuotaRefreshMinutes int    `json:"quota_refresh_minutes"`
 	BalanceFloor        int    `json:"balance_floor"` // 可用积分低于此值停止接单（0=关闭）
-	UsageMaxEntries     int    `json:"usage_max_entries"`
-	LogRequests         bool   `json:"log_requests"`
-	SendClientInfo      bool   `json:"log_client_info"`
-	IdentityMode        string `json:"identity_mode"`
-	SessionsFromClient  bool   `json:"sessions_from_client"`
+	// PreferDaily 选号优先花「今日赠送额度」（按自然日清零），再动永久积分。
+	// 上游不会因赠送额度耗尽报错（静默改扣永久积分、照常 200），只能靠排序实现。
+	PreferDaily bool `json:"prefer_daily_quota"`
+	// StrictModelCheck 请求的模型不在上游目录里时直接 404，不打上游。
+	// 必须默认开启：Loomy 对**认不出的模型名**不报错，而是静默回落到默认模型
+	// （实测 `no-such-model-xyz` → 200 且响应里 model 变成 DeepSeek-V4.1-Flash，
+	// 按默认模型扣分）。客户端会拿到一个"成功"的错答案，且账单对不上。
+	StrictModelCheck bool `json:"strict_model_check"`
+	// DeadModelTTLDays 上游回 404「模型暂未开放」时，把该模型记多久（天）。
+	// 期间 /v1/models 不列它、请求直接 404、不打上游；0 = 用内置默认 30 天。
+	DeadModelTTLDays   int    `json:"dead_model_ttl_days"`
+	UsageMaxEntries    int    `json:"usage_max_entries"`
+	LogRequests        bool   `json:"log_requests"`
+	SendClientInfo     bool   `json:"log_client_info"`
+	IdentityMode       string `json:"identity_mode"`
+	SessionsFromClient bool   `json:"sessions_from_client"`
 
 	path string `json:"-"`
 }
@@ -164,6 +175,9 @@ func Defaults() *Config {
 		SessionRenewDays:    3,
 		QuotaRefreshMinutes: 30,
 		BalanceFloor:        0,
+		PreferDaily:         true,
+		StrictModelCheck:    true,
+		DeadModelTTLDays:    30,
 		UsageMaxEntries:     20000,
 		LogRequests:         true,
 		SendClientInfo:      true,

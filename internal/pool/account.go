@@ -27,8 +27,12 @@ const (
 
 // Account 一个 Loomy 账号及其运行态。
 type Account struct {
-	Name     string `json:"name"`
-	LoginID  string `json:"loginid,omitempty"`
+	Name    string `json:"name"`
+	LoginID string `json:"loginid,omitempty"`
+	// Remark 账号备注：纯展示，不参与选号 / 计费 / 鉴权。
+	// 早期版本把它放在浏览器 localStorage，换浏览器、换入口（127.0.0.1 与局域网 IP
+	// 是两个 origin）、清站点数据都会丢；落进 auths/<账号>.json 后与账号一起备份。
+	Remark   string `json:"remark,omitempty"`
 	Password string `json:"password,omitempty"`
 	Enabled  bool   `json:"enabled"`
 	Paused   bool   `json:"paused,omitempty"` // 暂停选号：不参与转发，但照常签到/刷额度（保号）
@@ -437,6 +441,7 @@ func (a *Account) Public() map[string]any {
 		"name":                  a.Name,
 		"uid":                   a.Name, // 面板统一身份键（蓝本 workbuddy 用 uid，Loomy 用账号名）
 		"nickname":              a.Name,
+		"remark":                a.Remark,
 		"loginid":               a.LoginID,
 		"userid":                a.UserID,
 		"enabled":               a.Enabled,
@@ -549,6 +554,7 @@ func AccountFromMap(raw map[string]any, index int) *Account {
 		LoginID:    strOf(raw["loginid"], raw["phone"]),
 		Password:   strOf(raw["password"]),
 		Proxy:      strOf(raw["proxy"]),
+		Remark:     strOf(raw["remark"]),
 		Session:    strOf(raw["session"]),
 		UserID:     strOf(raw["userid"]),
 		ExpireAt:   int64Of(raw["expireAt"], raw["expire_at"]),
@@ -623,6 +629,11 @@ func (a *Account) persisted() map[string]any {
 	}
 	if a.Proxy != "" {
 		out["proxy"] = a.Proxy
+	}
+	// 备注必须写进快照：SaveAccount 是先 MarshalIndent 快照再整体覆盖文件，
+	// 漏一个字段就会被下一次额度刷新（每 30 分钟全量 persist）静默冲掉。
+	if a.Remark != "" {
+		out["remark"] = a.Remark
 	}
 	if a.Session != "" {
 		out["session"] = a.Session
