@@ -119,6 +119,17 @@ func main() {
 	stopCh := make(chan struct{})
 	go background(cfg, p, up, pl, stopCh)
 
+	// 模型目录预热：knownModel（裸 id 不补前缀）与图像模型拦截都依赖目录元数据，
+	// 冷缓存下两者都会误判，而上游对认不出的模型名是静默回落到默认模型
+	// （不报错、扣默认模型的积分）。异步执行，失败不阻塞启动。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if n := h.WarmCatalog(ctx); n > 0 {
+			log.Printf("模型目录预热：%d 个模型", n)
+		}
+	}()
+
 	// ---- 优雅退出 ----
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

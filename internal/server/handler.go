@@ -309,8 +309,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := h.resolveModel(req)
-	if h.imageOnlyModel(model) {
+	model := h.resolveModel(r.Context(), req)
+	if h.imageOnlyModel(r.Context(), model) {
 		// 图像模型走对话端点上游必回 404，且 404 会按 FaultNotFound 短冷却账号：
 		// 一个选错模型的请求不该冻掉唯一可用账号，所以在这里直接 400 拦住。
 		rejectImageModel(w, model)
@@ -652,9 +652,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
 		return
 	}
-	model := h.resolveModel(chatReq)
+	model := h.resolveModel(r.Context(), chatReq)
 	chatReq["model"] = model
-	if h.imageOnlyModel(model) {
+	if h.imageOnlyModel(r.Context(), model) {
 		rejectImageModel(w, model)
 		return
 	}
@@ -784,9 +784,9 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chatReq := bridge.ToOpenAI(req)
-	model := h.resolveModel(chatReq)
+	model := h.resolveModel(r.Context(), chatReq)
 	chatReq["model"] = model
-	if h.imageOnlyModel(model) {
+	if h.imageOnlyModel(r.Context(), model) {
 		writeAnthropicErr(w, http.StatusBadRequest,
 			"模型 "+model+" 只支持图像生成，不能用于对话；请改调 POST /v1/images/generations")
 		return
@@ -922,7 +922,7 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 				return
 			}
 		}
-		model := h.resolveModel(payload)
+		model := h.resolveModel(r.Context(), payload)
 
 		started := time.Now()
 		var tried []string
@@ -1009,7 +1009,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 
 // ---------------------------------------------------------------- 工具函数
 
-func (h *Handler) resolveModel(payload map[string]any) string {
+func (h *Handler) resolveModel(ctx context.Context, payload map[string]any) string {
 	model := str(payload["model"])
 	if model == "" {
 		model = h.Cfg.DefaultModel
@@ -1022,7 +1022,7 @@ func (h *Handler) resolveModel(payload map[string]any) string {
 		// 我们对外的 /v1/models 原样透出这些 id；如果这里再补 imodel/，上游认不出
 		// 就会**静默回落到默认模型**（客户端以为在用 spark-x，实际扣的是 DeepSeek 的
 		// 积分，且响应里 model 字段会变）。所以已知的裸 id 一律不补前缀。
-		if !strings.Contains(model, "/") && !h.knownModel(model) {
+		if !strings.Contains(model, "/") && !h.knownModel(ctx, model) {
 			model = "imodel/" + model
 		}
 	}
@@ -1032,13 +1032,33 @@ func (h *Handler) resolveModel(payload map[string]any) string {
 	return model
 }
 
-// knownModel 判断裸 id 是否就是上游目录里的模型（命中则不补 imodel/ 前缀）。
-// 缓存未命中（还没查过 /models）时返回 false，退回旧的补前缀行为。
-func (h *Handler) knownModel(id string) bool {
+// catalog 取模型目录，**只读缓存**：对话热路径不该为了一次类型判断去等一趟上游。
+// 缓存由启动预热（WarmCatalog）、/v1/models 与面板查询填充；缓存过期时
+// ModelCache 会返回上一份目录，所以预热过就有类型信息可用。
+func (h *Handler) catalog(ctx context.Context) []config.Model {
 	if h.Models == nil {
-		return false
+		return nil
 	}
-	for _, m := range h.Models.Get(context.Background(), "") {
+	return h.Models.Get(ctx, "")
+}
+
+// WarmCatalog 用任一可用登录态把模型目录拉进缓存，返回条目数。
+//
+// 必须在启动时调一次（见 cmd/server）：knownModel（裸 id 不补前缀）与
+// imageOnlyModel（图像模型不进对话端点）都依赖目录里的元数据，冷缓存下
+// 两者都会误判，而上游对认不出的模型名不会报错——它静默回落到默认模型
+// （实测响应里 model 变成 DeepSeek-V4.1-Flash，扣的是默认模型的积分）。
+func (h *Handler) WarmCatalog(ctx context.Context) int {
+	if h.Models == nil {
+		return 0
+	}
+	return len(h.Models.Get(ctx, h.anySession()))
+}
+
+// knownModel 判断裸 id 是否就是上游目录里的模型（命中则不补 imodel/ 前缀）。
+// 目录拉不到时返回 false，退回旧的补前缀行为。
+func (h *Handler) knownModel(ctx context.Context, id string) bool {
+	for _, m := range h.catalog(ctx) {
 		if m.ID == id {
 			return true
 		}
@@ -1047,15 +1067,10 @@ func (h *Handler) knownModel(id string) bool {
 }
 
 // imageOnlyModel 判断模型是否只能走生图端点（上游目录里 type=image）。
-//
-// 只看缓存（session 传空）：一个参数错的客户端请求不该触发上游 /models 查询，
-// 缓存未命中时宁可放行让上游自己拒绝，也不臆测模型类型。
-func (h *Handler) imageOnlyModel(model string) bool {
-	if h.Models == nil {
-		return false
-	}
+// 目录拉不到时返回 false：宁可放行让上游自己判定，也不臆测模型类型。
+func (h *Handler) imageOnlyModel(ctx context.Context, model string) bool {
 	id := strings.TrimPrefix(model, "imodel/")
-	for _, m := range h.Models.Get(context.Background(), "") {
+	for _, m := range h.catalog(ctx) {
 		if strings.EqualFold(m.ID, id) {
 			return m.IsImage()
 		}

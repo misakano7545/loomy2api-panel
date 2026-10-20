@@ -909,3 +909,45 @@ func TestModelsMarksImageEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// TestWarmCatalogFeedsImageGuard 回归：启动预热（WarmCatalog）之后，即使之前
+// 从没查过目录，图像模型也必须被对话端点拦住。目录靠 /v1/models 或面板查询
+// 顺手填充是不可靠的——只有预热能保证冷启后第一个请求就拿得到 type 元数据。
+func TestWarmCatalogFeedsImageGuard(t *testing.T) {
+	fs := imageCatalogUpstream(t)
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	if n := h.WarmCatalog(context.Background()); n != 3 {
+		t.Fatalf("预热应拿到 3 个模型，实际 %d", n)
+	}
+	before := len(fs.seen)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Hy-Image-3.5-preview","messages":[{"role":"user","content":"画只猫"}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("预热后图像模型应被拒，状态码 = %d；body=%s", w.Code, w.Body.String())
+	}
+	if len(fs.seen) != before {
+		t.Fatalf("被拦的请求不该再打上游：多出 %d 次", len(fs.seen)-before)
+	}
+}
+
+// TestChatPathDoesNotFetchCatalog 对话热路径不能为了类型判断去打上游 /models：
+// 缓存没预热时就放行（degraded），绝不能在请求里等一趟目录查询。
+func TestChatPathDoesNotFetchCatalog(t *testing.T) {
+	fs := imageCatalogUpstream(t)
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil) // 不预热
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"Hy-Image-3.5-preview","messages":[{"role":"user","content":"画只猫"}]}`))
+	h.Routes().ServeHTTP(httptest.NewRecorder(), req)
+
+	for _, r := range fs.seen {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			t.Fatalf("对话请求不该触发目录查询：%s", r.URL.Path)
+		}
+	}
+}
