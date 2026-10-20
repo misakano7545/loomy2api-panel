@@ -1,719 +1,1941 @@
-// app.js 面板前端逻辑（无框架、无外部依赖，同源脚本以满足 CSP script-src 'self'）。
 'use strict';
+/* Loomy2API 控制台前端。
+ *
+ * 结构、组件与交互语义完整复刻蓝本 workbuddy2api-panel（账号池 / 用量 / 积分构成 /
+ * 模型 / 配置 / 日志六视图 + trange 时间控件 + SVG 用量图 + 模型锁池 + 积分账本 +
+ * 请求记录 + 错误汇总 + 备注 + 主题三态），数据端点全部接 Loomy 真实上游：
+ *   - 账号运维：登录 / 签到（first-login 幂等）/ 余额 / 暂停选号 / 解冻 / 禁用 / 移除；
+ *   - 积分口径：每日赠送（登录后刷新 5000、次日周期到期）+ 长期积分（不到期），
+ *     扣费顺序（活动/兑换码 → 长期）由上游执行，面板只做拆分镜像；
+ *   - 蓝本专有功能（OAuth 浏览器登录、成长任务、旅行、活跃上报、开学季券码）
+ *     在 Loomy 抓包核对后确认上游无对应端点，不搬空壳。
+ *
+ * 蓝本的踩坑注释一并移植并保留出处（TDZ、CSP、SVG title、innerHTML 转义等）。 */
 
-const THEME_KEY = 'loomy2api.theme';
-const state = {
-  key: localStorage.getItem('loomy2api_key') || '',
-  view: 'accounts',
-  overview: null,
-  accounts: [],
-  models: [],
-  cfg: null,
-  timer: null,
+/* ── 状态 ─────────────────────────────────────────────────────────── */
+const LS_KEY = 'loomy2api.key', LS_THEME = 'loomy2api.theme';
+/* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
+const LS_REMARKS = 'loomy2api.remarks.v1';
+let remarksCache = null;
+let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
+let view = 'accounts';
+let overviewData = null, cfgLoaded = null;
+let logPin = true;
+let refTimer = null;
+let smsMsgID = '';
+/* 视图级筛选状态（模块级声明放文件顶部，避开顶层 go() 早于声明执行的 TDZ）。 */
+let mdAll = [];
+let mdFilter = { q: '', cap: '', sort: 'default' };
+let usDim = 'account', usCreditDim = 'account', usSort = 'total';
+let usageData = null;
+let reqFilter = { q: '', outcome: '' };
+let reqEntries = [];
+
+const $ = id => document.getElementById(id);
+
+/* ── 主题 ─────────────────────────────────────────────────────────── */
+/* 三态翻转（跟随系统 → 浅色 → 深色），点击总是切到下一个明确态。 */
+function effTheme() {
+  return theme === 'auto' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : theme;
+}
+function applyTheme() {
+  const eff = effTheme();
+  document.documentElement.dataset.theme = eff;
+  $('icoTheme').innerHTML = eff === 'light'
+    ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
+    : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
+  $('btnTheme').title = '当前：' + ({ auto: '跟随系统', light: '浅色', dark: '深色' }[theme]) + '（点击切换）';
+}
+$('btnTheme').onclick = () => {
+  theme = theme === 'auto' ? 'light' : theme === 'light' ? 'dark' : 'auto';
+  localStorage.setItem(LS_THEME, theme);
+  applyTheme();
 };
+applyTheme();
 
-// ---------------------------------------------------------------- 基础工具
+/* ── 手机抽屉导航（≤760px；桌面按钮隐藏、类名无副作用） ─────────────── */
+const navEl = document.querySelector('.nav'), navScrim = $('navScrim'), btnNav = $('btnNav');
+function navSet(open) {
+  if (!navEl || !navScrim) return;
+  navEl.classList.toggle('open', open);
+  navScrim.classList.toggle('on', open);
+  document.body.classList.toggle('nav-open', open);
+  if (btnNav) btnNav.setAttribute('aria-expanded', String(open));
+}
+if (btnNav && navScrim) {
+  btnNav.onclick = () => navSet(!navEl.classList.contains('open'));
+  navScrim.onclick = () => navSet(false);
+}
+addEventListener('keydown', e => { if (e.key === 'Escape') navSet(false); });
 
-function $(sel, root) { return (root || document).querySelector(sel); }
-function $$(sel, root) { return Array.from((root || document).querySelectorAll(sel)); }
-
-function el(tag, attrs, children) {
-  const node = document.createElement(tag);
-  if (attrs) {
-    for (const [k, v] of Object.entries(attrs)) {
-      if (v === null || v === undefined || v === false) continue;
-      if (k === 'class') node.className = v;
-      else if (k === 'text') node.textContent = v;
-      else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
-      else node.setAttribute(k, v);
-    }
-  }
-  for (const c of [].concat(children || [])) {
-    if (c === null || c === undefined || c === false) continue;
-    node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
-  }
-  return node;
+/* ── 请求 ─────────────────────────────────────────────────────────── */
+async function api(path, opts = {}) {
+  const h = Object.assign({}, opts.headers || {});
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  if (opts.body) h['Content-Type'] = 'application/json';
+  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
+  // status 挂到错误上：调用方靠它区分「可重试的抖动」与「重试无意义的终态」。
+  if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+  return d;
+}
+function toast(msg, cls) {
+  const el = document.createElement('div');
+  el.className = 'tst ' + (cls || '');
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3600);
+}
+// esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
+// 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
+// 显式替换 5 个字符：& < > " '（& 必须最先，避免二次转义）。
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+function ago(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return '—';
+  const sec = Math.max(0, (Date.now() - t) / 1000);
+  if (sec < 60) return '刚刚';
+  if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
+  if (sec < 86400) return Math.floor(sec / 3600) + ' 小时前';
+  return Math.floor(sec / 86400) + ' 天前';
+}
+function dur(sec) {
+  sec = Math.max(0, Math.round(Number(sec || 0)));
+  if (!sec) return '0s';
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return (d ? d + 'd' : '') + (h ? h + 'h' : '') + (!d ? m + 'm' : '');
 }
 
-// Toast 挂在 #toasts，左侧色条区分结果（蓝本同款）。
-function toast(msg, kind) {
-  const cls = 'tst' + (kind === 'ok' ? ' ok' : kind === 'bad' ? ' err' : '');
-  const t = el('div', { class: cls, text: msg });
-  $('#toasts').appendChild(t);
-  setTimeout(() => t.remove(), kind === 'bad' ? 6000 : 3200);
+/* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
+   为什么区间一律由前端算好再发：
+     - 「今天」必须是**浏览器本地时区**的 00:00 起。服务端时区未必与浏览器一致
+       （容器常挂 TZ=Asia/Shanghai，而浏览器可能在任何时区），让服务端算"今天"
+       会在跨时区时切错日子。
+     - 「自定义」本来就是用户挑的具体时刻，没有任何服务端推导空间。
+   滚动预设（近 N 小时/天）则保留 hours 参数：服务端整点对齐的滚动窗口与旧
+   行为逐位一致，前端自己减 N 小时会多算/少算一个边界桶。 */
+const TRANGE_PRESETS = [
+  ['today', '今天'],
+  ['24', '近 24 小时'],
+  ['72', '近 3 天'],
+  ['168', '近 7 天'],
+  ['720', '近 30 天'],
+  ['0', '全部历史'],
+  ['custom', '自定义…'],
+];
+const TRANGE_DEFAULT = '72';
+const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
+
+function dtLocalValue(d) {
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function dtLocalParse(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+function trangeMidnight() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+function trangeState(id) {
+  if (!trangeStates.has(id)) {
+    trangeStates.set(id, { preset: TRANGE_DEFAULT, from: trangeMidnight(), to: new Date() });
+  }
+  return trangeStates.get(id);
+}
+// trangeRender 画出控件骨架（幂等：重复调用会保留当前状态）。
+function trangeRender(id) {
+  const host = $(id);
+  if (!host) return;
+  const st = trangeState(id);
+  const custom = st.preset === 'custom';
+  host.innerHTML =
+    '<select aria-label="时间范围">' +
+    TRANGE_PRESETS.map(([v, label]) =>
+      '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
+    '</select>' +
+    '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
+    '<input type="datetime-local" class="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
+    '<span class="tr-sep">→</span>' +
+    '<input type="datetime-local" class="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
+    '</span>';
+  const preset = host.querySelector('select');
+  if (preset) preset.onchange = () => {
+    st.preset = preset.value;
+    // 从别的预设切到自定义时，把区间重置为"今天 00:00 → 现在"，
+    // 免得用户上次留下的半年区间被无声沿用。
+    if (st.preset === 'custom' && (!st.from || !st.to)) { st.from = trangeMidnight(); st.to = new Date(); }
+    trangeRender(id);
+    trangeEmit(id);
+  };
+  const fromEl = host.querySelector('.tr-from');
+  const toEl = host.querySelector('.tr-to');
+  const readCustom = () => {
+    st.from = dtLocalParse(fromEl.value);
+    st.to = dtLocalParse(toEl.value);
+    // 起止颠倒就地标红（不静默纠正：用户可能正输到一半）。
+    const bad = st.from && st.to && st.from > st.to;
+    fromEl.classList.toggle('tr-bad', !!bad);
+    toEl.classList.toggle('tr-bad', !!bad);
+    if (bad) return;
+    trangeEmit(id);
+  };
+  if (fromEl) fromEl.onchange = readCustom;
+  if (toEl) toEl.onchange = readCustom;
+}
+const trangeHandlers = new Map();
+// trangeBind 渲染控件并登记变化回调。**不**在绑定时触发回调：各视图的首次加载
+// 由 go() 统一驱动，这里再触发一次会让打开页面时打两遍接口。
+function trangeBind(id, onChange, preset) {
+  trangeHandlers.set(id, onChange);
+  if (preset) trangeState(id).preset = preset;
+  trangeRender(id);
+}
+function trangeEmit(id) {
+  const fn = trangeHandlers.get(id);
+  if (fn) fn();
+}
+// trangeQuery 把当前选择翻译成查询参数。
+//   rolling=true  → 滚动预设发 hours（服务端整点对齐），今天/自定义发 from/to
+//   rolling=false → 一律发 from/to（线性日志，前端算区间更直观）。
+// 「全部历史」：**用量**必须显式发 hours=0 —— 后端「不给参数」的默认是短窗口，
+// 空查询会让「全部历史」静默变成 24h（蓝本 issue #121 的同族坑）。
+function trangeQuery(id, rolling) {
+  const st = trangeState(id);
+  const q = new URLSearchParams();
+  const sec = d => Math.floor(d.getTime() / 1000);
+  if (st.preset === 'custom') {
+    if (st.from) q.set('from', sec(st.from));
+    if (st.to) q.set('to', sec(st.to));
+    return q;
+  }
+  if (st.preset === 'today') {
+    q.set('from', sec(trangeMidnight()));
+    return q;
+  }
+  if (st.preset === '0') {
+    if (rolling) q.set('hours', '0');
+    return q;
+  }
+  if (rolling) { q.set('hours', st.preset); return q; }
+  q.set('from', sec(new Date(Date.now() - Number(st.preset) * 3600 * 1000)));
+  return q;
+}
+// trangeLabel 人读口径，用于「用量总览」右上角这类需要回显区间的位置。
+function trangeLabel(id) {
+  const st = trangeState(id);
+  const found = TRANGE_PRESETS.find(p => p[0] === st.preset);
+  if (st.preset !== 'custom') return found ? found[1] : '';
+  if (!st.from && !st.to) return '自定义';
+  const f = d => d ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') : '…';
+  return f(st.from) + ' → ' + f(st.to);
 }
 
-async function api(path, opts) {
-  const options = Object.assign({ headers: {} }, opts || {});
-  if (state.key) options.headers['Authorization'] = 'Bearer ' + state.key;
-  if (options.body && typeof options.body !== 'string') {
-    options.headers['Content-Type'] = 'application/json';
-    options.body = JSON.stringify(options.body);
-  }
-  const res = await fetch(path, options);
-  if (res.status === 401) {
-    openKey();
-    throw new Error('认证失败');
-  }
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
-  if (!res.ok) {
-    const msg = (data && (data.error || data.message)) || ('HTTP ' + res.status);
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
-  }
-  return data;
-}
-
-function fmtNum(n) {
-  if (n === null || n === undefined) return '—';
-  if (typeof n !== 'number') return String(n);
-  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (Math.abs(n) >= 1e4) return (n / 1e3).toFixed(1) + 'k';
-  return n.toLocaleString('zh-CN');
-}
-function fmtDuration(sec) {
-  if (sec === null || sec === undefined || sec <= 0) return '—';
-  if (sec < 60) return Math.round(sec) + 's';
-  if (sec < 3600) return Math.round(sec / 60) + 'm';
-  if (sec < 86400) return (sec / 3600).toFixed(1) + 'h';
-  return (sec / 86400).toFixed(1) + 'd';
+/* ── 数字格式 ─────────────────────────────────────────────────────── */
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
 }
 function fmtMs(ms) {
-  if (!ms && ms !== 0) return '—';
-  if (ms < 1000) return ms + 'ms';
-  return (ms / 1000).toFixed(2) + 's';
+  ms = Number(ms || 0);
+  if (!ms) return '—';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+  return Math.round(ms) + 'ms';
 }
-function fmtTime(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts * 1000);
-  const p = (n) => String(n).padStart(2, '0');
-  return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+function trimFixed(s) {
+  if (!String(s).includes('.')) return String(s);
+  return String(s).replace(/0+$/, '').replace(/\.$/, '');
 }
-
-// ---------------------------------------------------------------- 主题
-
-// 三态循环：跟随系统 → 浅色 → 深色。判定与 theme.js 必须一致，否则刷新二次闪烁。
-function effTheme() {
-  const saved = localStorage.getItem(THEME_KEY) || 'auto';
-  if (saved !== 'auto') return saved;
-  return window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+function fmtPoints(n) {
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return '—';
+  return v.toLocaleString('zh-CN');
 }
-function applyTheme(saved) {
-  localStorage.setItem(THEME_KEY, saved);
-  document.documentElement.setAttribute('data-theme', effTheme());
-}
-$('#btnTheme').addEventListener('click', () => {
-  const cur = localStorage.getItem(THEME_KEY) || 'auto';
-  applyTheme(cur === 'auto' ? 'light' : cur === 'light' ? 'dark' : 'auto');
-});
-
-// ---------------------------------------------------------------- 密钥门
-
-function openKey() {
-  $('#keyVeil').classList.add('on');
-  $('#keyInput').focus();
-}
-function closeKey() { $('#keyVeil').classList.remove('on'); }
-
-function submitKey() {
-  const key = $('#keyInput').value.trim();
-  if (!key) return;
-  state.key = key;
-  localStorage.setItem('loomy2api_key', key);
-  $('#keyErr').hidden = true;
-  refreshAll().then(() => {
-    closeKey();
-    loadView(state.view);
-  }).catch((e) => {
-    $('#keyErr').textContent = e.message || '密钥不正确，请重试。';
-    $('#keyErr').hidden = false;
-    state.key = '';
-    localStorage.removeItem('loomy2api_key');
-  });
-}
-$('#btnKey').addEventListener('click', submitKey);
-$('#keyInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') submitKey(); });
-
-$('#btnLogout').addEventListener('click', () => {
-  state.key = '';
-  localStorage.removeItem('loomy2api_key');
-  $('#keyInput').value = '';
-  openKey();
-});
-
-// ---------------------------------------------------------------- 导航
-
-const TITLES = { accounts: '账号池', usage: '用量', models: '模型与档位', logs: '运行日志', config: '配置' };
-
-$('.nav ul').addEventListener('click', (e) => {
-  const a = e.target.closest('a[data-view]');
-  if (!a) return;
-  e.preventDefault();
-  switchView(a.dataset.view);
-  closeNav();
-});
-window.addEventListener('hashchange', () => {
-  const v = location.hash.replace('#', '');
-  if (TITLES[v]) switchView(v);
-});
-
-function switchView(view) {
-  state.view = view;
-  $$('.nav a[data-view]').forEach((a) => a.classList.toggle('on', a.dataset.view === view));
-  $$('.view').forEach((s) => { s.hidden = s.id !== 'view-' + view; });
-  $('#ttl').textContent = TITLES[view] || view;
-  if (location.hash !== '#' + view) history.replaceState(null, '', '#' + view);
-  loadView(view);
+function fmtLocalDateTime(ms) {
+  if (!ms) return '—';
+  return new Date(ms).toLocaleString('zh-CN', { hour12: false });
 }
 
-function loadView(view) {
-  if (view === 'usage') loadUsage();
-  if (view === 'models') loadModels();
-  if (view === 'logs') { loadRequests(); loadServiceLogs(); loadErrors(); }
-  if (view === 'config') loadConfig();
-}
-
-// 手机版导航抽屉
-function closeNav() {
-  $('#nav').classList.remove('open');
-  $('#navScrim').classList.remove('on');
-  $('#btnNav').setAttribute('aria-expanded', 'false');
-  document.body.classList.remove('nav-open');
-}
-$('#btnNav').addEventListener('click', () => {
-  const open = !$('#nav').classList.contains('open');
-  $('#nav').classList.toggle('open', open);
-  $('#navScrim').classList.toggle('on', open);
-  $('#btnNav').setAttribute('aria-expanded', String(open));
-  document.body.classList.toggle('nav-open', open);
-});
-$('#navScrim').addEventListener('click', closeNav);
-
-// ---------------------------------------------------------------- 账号池
-
-async function refreshAll() {
-  const [overview, accounts] = await Promise.all([
-    api('/panel/api/overview'),
-    api('/panel/api/accounts'),
-  ]);
-  state.overview = overview;
-  state.accounts = accounts.accounts || [];
-  renderStats(overview);
-  renderAccounts(state.accounts);
-  renderSig(overview);
-}
-
-function renderSig(ov) {
-  const healthy = ov.healthy || 0;
-  const total = ov.total || 0;
-  const pulse = $('#navPulse');
-  pulse.className = 'pulse' + (total === 0 ? ' warn' : healthy === 0 ? ' bad' : '');
-  $('#navState').textContent = total === 0 ? '无账号' : `可用 ${healthy}/${total}`;
-  $('#navVer').textContent = 'v' + (ov.version || '-');
-  $('#navUp').textContent = ov.upstream || '-';
-  $('#subMeta').textContent = total === 0 ? '无账号' : `${healthy}/${total} 可用`;
-  $('#accNote').textContent = total === 0 ? '还没有账号' : `${total} 个账号`;
-}
-
-function renderStats(ov) {
-  const u = (ov.usage && (ov.usage['24h'] || ov.usage.today)) || {};
-  $('#sTotal').textContent = fmtNum(ov.total);
-  $('#sHealthy').textContent = fmtNum(ov.healthy);
-  $('#sCooling').textContent = fmtNum(ov.cooling);
-  $('#sDisabled').textContent = fmtNum(ov.disabled);
-  $('#sPoints').textContent = fmtNum(ov.available_points);
-  $('#sInflight').textContent = fmtNum(ov.inflight);
-  $('#subMeta').textContent = `${ov.healthy || 0}/${ov.total || 0} 可用 · 24h ${fmtNum(u.total)} 请求`;
-}
-
-function accountStatus(a) {
-  if (!a.enabled) return { text: '已禁用', cls: 'mute', row: 'off' };
-  if (a.in_breaker) return { text: '熔断 ' + fmtDuration(a.breaker_seconds_left), cls: 'bad', row: 'off' };
-  if (a.in_cooldown) {
-    const kind = a.cooldown_kind === 'hard' ? '额度冷却' : '限流冷却';
-    return { text: kind + ' ' + fmtDuration(a.cooldown_seconds_left), cls: 'warn', row: 'cool' };
-  }
-  if (!a.session_valid) return { text: '登录态失效', cls: 'bad', row: 'off' };
-  return { text: '可用', cls: 'ok', row: '' };
-}
-
-function renderAccounts(accounts) {
-  const tbody = $('#accBody');
-  if (!accounts.length) {
-    tbody.replaceChildren(el('tr', {}, [
-      el('td', { colspan: '8', class: 'empty' }, [el('div', { class: 'big', text: '还没有账号' }), '点右上「+」添加']),
-    ]));
-    return;
-  }
-  const maxPts = Math.max(1, ...accounts.map((a) => Number(a.available || 0)));
-  tbody.replaceChildren(...accounts.map((a) => {
-    const st = accountStatus(a);
-    const pts = Number(a.available || 0);
-    const ops = el('div', { class: 'acts' }, [
-      el('button', { class: 'xs', text: '登录', onclick: () => act(a.name, 'login') }),
-      el('button', { class: 'xs', text: '刷额度', onclick: () => act(a.name, 'refresh') }),
-      el('button', { class: 'xs', text: '解冻', onclick: () => act(a.name, 'revive') }),
-      a.enabled
-        ? el('button', { class: 'xs danger', text: '禁用', onclick: () => act(a.name, 'disable') })
-        : el('button', { class: 'xs', text: '启用', onclick: () => act(a.name, 'enable') }),
-      el('button', { class: 'xs danger', text: '移除', onclick: () => removeAccount(a.name) }),
-    ]);
-    return el('tr', { class: st.row }, [
-      el('td', { class: 'mark' }, [el('i')]),
-      el('td', { class: 'who' }, [
-        el('div', { class: 'nm', text: a.name }),
-        el('div', { class: 'id', text: a.loginid || (a.userid ? 'uid ' + a.userid : '—') }),
-      ]),
-      el('td', {}, [el('span', { class: 'tag ' + st.cls, text: st.text })]),
-      el('td', { class: 'cred' }, [
-        el('div', { class: 'n', text: fmtNum(a.available) }),
-        el('div', { class: 'bar' }, [el('i', { style: 'width:' + Math.round(pts / maxPts * 100) + '%' })]),
-      ]),
-      el('td', { class: 'num' }, [
-        a.session_days_left !== null && a.session_days_left !== undefined
-          ? a.session_days_left.toFixed(1) + 'd'
-          : '—',
-      ]),
-      el('td', { class: 'num', text: fmtNum(a.requests) + ' / ' + fmtNum(a.failures) }),
-      el('td', { class: 'num', text: String(a.inflight || 0) }),
-      el('td', { class: 'c-acts' }, [ops]),
-    ]);
-  }));
-}
-
-async function act(name, action) {
+/* ── 密钥门 ───────────────────────────────────────────────────────── */
+function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+$('btnKey').onclick = async () => {
+  const v = $('keyInput').value.trim();
+  if (!v) return;
+  localStorage.setItem(LS_KEY, v);
   try {
-    await api(`/panel/api/accounts/${encodeURIComponent(name)}/${action}`, { method: 'POST' });
-    toast(`${name} · ${action} 完成`, 'ok');
-    await refreshAll();
-  } catch (e) {
-    toast(e.message, 'bad');
+    await api('overview');
+    $('keyErr').hidden = true;
+    $('keyVeil').classList.remove('on');
+    start();
+  } catch (e) { $('keyErr').hidden = false; }
+};
+$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+
+// 登出：api_key / 面板密码是唯一凭据（服务端只做 Bearer 比对，无会话无 cookie 可失效），
+// 所以"登出"= 清掉本机保存的密钥并重载——重载把内存里的定时器与已渲染数据一并清空，
+// 无密钥时 start() 的首次请求 401 会自动弹回密钥门（data-lock="1"，不可绕过）。
+$('btnLogout').onclick = () => {
+  if (!confirm('登出将清空本机保存的密钥，需要重新输入才能进入面板。确认登出？')) return;
+  localStorage.removeItem(LS_KEY);
+  location.reload();
+};
+
+/* ── 路由 ─────────────────────────────────────────────────────────── */
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', models: '模型与档位', config: '配置', logs: '运行日志' };
+function go(v) {
+  navSet(false);
+  view = v;
+  document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
+  document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
+  $('ttl').textContent = TITLES[v];
+  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'config') loadConfig();
+  if (v === 'logs') loadLogs();
+  if (v === 'usage') loadUsage();
+  if (v === 'packages') loadPackages();
+}
+document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
+/* 首次进入延到本轮脚本求值之后再 go()。
+   go() 会同步触发视图数据加载，而这些函数读到的模块级变量在文件后半段才初始化——
+   直接深链 #usage / #packages 打开页面时会踩 TDZ（"Cannot access 'x' before
+   initialization"），表现为该页永远显示"读取失败"，点导航进去却正常（蓝本实证坑）。 */
+setTimeout(() => {
+  const hash = (location.hash || '#accounts').slice(1);
+  go(hash in TITLES ? hash : 'accounts');
+}, 0);
+
+/* ── 账号池 ───────────────────────────────────────────────────────── */
+function accountStatus(s, now) {
+  if (s.disabled) return { cls: 'off', tag: '<span class="tag bad">已禁用</span>' };
+  // 暂停选号：与禁用同属「不可选」，但照常签到/刷额度保号。
+  if (s.paused) return { cls: 'off', tag: '<span class="tag warn">已暂停选号</span>' };
+  const cool = Math.max(Number(s.cooldown_seconds_left || 0), Number(s.breaker_seconds_left || 0));
+  if (cool > 0) {
+    const bl = Number(s.breaker_seconds_left || 0);
+    const kind = bl >= Number(s.cooldown_seconds_left || 0) && bl > 0 ? '熔断'
+      : (s.cooldown_kind === 'hard' ? '额度冷却' : '限流冷却');
+    return { cls: 'cool', tag: '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>' };
   }
+  if (!s.session_valid) return { cls: 'off', tag: '<span class="tag bad">登录态失效</span>' };
+  return { cls: '', tag: '<span class="tag ok">可用</span>' };
 }
 
-async function removeAccount(name) {
-  if (!confirm(`确认移除账号 ${name}？凭证文件也会删除。`)) return;
-  try {
-    await api(`/panel/api/accounts/${encodeURIComponent(name)}/remove`, { method: 'POST' });
-    toast(`${name} 已移除`, 'ok');
-    await refreshAll();
-  } catch (e) {
-    toast(e.message, 'bad');
-  }
+// modelLocksHtml 账号行内的模型级限流小框（数据是 account.model_cooldowns =
+// {model: {seconds_left, reason}}）。
+function modelLocksHtml(cooldowns, now) {
+  const entries = Object.entries(cooldowns || {}).filter(([, v]) => v && Number(v.seconds_left) > 0);
+  if (!entries.length) return '';
+  return '<div class="rate-limits">' + entries.map(([model, v]) => {
+    const until = now + Number(v.seconds_left) * 1000;
+    const title = model + '\n模型级限流' + (v.reason ? '\n原因：' + v.reason : '') +
+      '\n预计恢复：' + fmtLocalDateTime(until) + '（剩余 ' + dur(v.seconds_left) + '）';
+    return '<div class="rate-limit" title="' + esc(title) + '"><b>' + esc(model) +
+      '</b><span>' + esc('剩余 ' + dur(v.seconds_left)) + '</span></div>';
+  }).join('') + '</div>';
 }
 
-$('#btnRefreshAll').addEventListener('click', async () => {
-  const btn = $('#btnRefreshAll');
-  btn.disabled = true;
-  btn.textContent = '刷新中…';
-  try {
-    const res = await api('/panel/api/refresh_all', { method: 'POST' });
-    const bad = (res.results || []).filter((r) => !r.ok).length;
-    toast(`已刷新 ${(res.results || []).length} 个账号` + (bad ? `，${bad} 个失败` : ''), bad ? 'bad' : 'ok');
-    await refreshAll();
-  } catch (e) {
-    toast(e.message, 'bad');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '全部刷新额度';
-  }
-});
-
-$('#btnLoginAll').addEventListener('click', async () => {
-  if (!confirm('对全部有手机号+密码的账号重新登录？')) return;
-  const btn = $('#btnLoginAll');
-  btn.disabled = true;
-  btn.textContent = '登录中…';
-  try {
-    const res = await api('/panel/api/login_all', { method: 'POST' });
-    const list = res.results || [];
-    const ok = list.filter((r) => r.ok).length;
-    toast(`重新登录：成功 ${ok} / ${list.length}`, ok ? 'ok' : 'bad');
-    await refreshAll();
-  } catch (e) {
-    toast(e.message, 'bad');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '全部重新登录';
-  }
-});
-
-$('#btnRefresh').addEventListener('click', () => {
-  refreshAll().then(() => loadView(state.view)).then(() => toast('已刷新', 'ok')).catch((e) => toast(e.message, 'bad'));
-});
-
-// 表单不提交（CSP 禁内联事件处理器，这里统一拦）
-['#addForm', '#cfgForm'].forEach((sel) => {
-  $(sel).addEventListener('submit', (e) => e.preventDefault());
-});
-
-// 添加账号（弹层）
-$('#btnAdd').addEventListener('click', () => {
-  $('#addErr').hidden = true;
-  $('#addVeil').classList.add('on');
-  $('#addForm').querySelector('[name=name]').focus();
-});
-$('#btnAddCancel').addEventListener('click', () => $('#addVeil').classList.remove('on'));
-$('#btnAddSave').addEventListener('click', async () => {
-  const f = new FormData($('#addForm'));
-  const body = {
-    name: (f.get('name') || '').trim(),
-    loginid: (f.get('loginid') || '').trim(),
-    password: f.get('password') || '',
-    session: (f.get('session') || '').trim(),
-    proxy: (f.get('proxy') || '').trim(),
-    login: true,
-  };
-  try {
-    await api('/panel/api/accounts', { method: 'POST', body });
-    toast('账号已添加', 'ok');
-    $('#addForm').reset();
-    $('#addVeil').classList.remove('on');
-    await refreshAll();
-  } catch (err) {
-    $('#addErr').textContent = err.message;
-    $('#addErr').hidden = false;
-  }
-});
-
-// ---------------------------------------------------------------- 用量
-
-$('#usageWindow').addEventListener('change', loadUsage);
-
-async function loadUsage() {
-  const win = $('#usageWindow').value;
-  const spans = { today: 86400, '24h': 86400, '3d': 259200, '7d': 604800, '30d': 2592000 };
-  const from = Math.floor(Date.now() / 1000) - (spans[win] || 86400);
-  try {
-    const data = await api(`/panel/api/usage?from=${from}&hours=24`);
-    renderUsage(data);
-  } catch (e) {
-    toast(e.message, 'bad');
-  }
-}
-
-function renderUsage(data) {
-  const w = data.window || {};
-  const cards = [
-    { k: '请求', v: fmtNum(w.total), cls: '' },
-    { k: 'prompt token', v: fmtNum(w.prompt_tokens), cls: '' },
-    { k: 'completion token', v: fmtNum(w.completion_tokens), cls: '' },
-    { k: '思考 token', v: fmtNum(w.reasoning_tokens), cls: '' },
-    { k: '积分', v: fmtNum(w.points), cls: '' },
-    { k: '平均延迟', v: fmtMs(w.avg_latency_ms), cls: '' },
-  ];
-  if (w.fail) cards[0].cls = 'bad';
-  $('#usStats').replaceChildren(...cards.map((c) => el('div', { class: 'stat ' + c.cls }, [
-    el('div', { class: 'v', text: String(c.v) }),
-    el('div', { class: 'k', text: c.k }),
-  ])));
-  $('#usNote').textContent = w.fail ? `${fmtNum(w.total)} 请求 · ${fmtNum(w.fail)} 失败` : `${fmtNum(w.total)} 请求`;
-
-  // token 全 0 时退化按请求数缩放，否则整段只有 2% 的空杠
-  const hourly = data.hourly || [];
-  const metric = (h) => (h.tokens || 0) || (h.requests || 0);
-  const max = Math.max(1, ...hourly.map(metric));
-  $('#usChart').replaceChildren(...hourly.map((h) => el('div', {
-    class: 'b',
-    style: 'height:' + Math.max(2, metric(h) / max * 100) + '%',
-    title: `${h.hour} · ${h.requests} 次 · ${h.tokens} token · ${h.points} 积分`,
-  })));
-
-  fillGroup('#usByAccount', w.by_account);
-  fillGroup('#usByModel', w.by_model);
-}
-
-function fillGroup(sel, groups) {
-  const tbody = $(sel);
-  const rows = Object.entries(groups || {}).sort((a, b) => b[1].requests - a[1].requests);
-  if (!rows.length) {
-    tbody.replaceChildren(el('tr', {}, [el('td', { colspan: '5', class: 'empty', text: '暂无数据' })]));
-    return;
-  }
-  tbody.replaceChildren(...rows.map(([key, b]) => el('tr', {}, [
-    el('td', { class: 'num', text: key }),
-    el('td', { class: 'num', text: fmtNum(b.requests) }),
-    el('td', { class: 'num', text: fmtNum((b.prompt_tokens || 0) + (b.completion_tokens || 0)) }),
-    el('td', { class: 'num', text: fmtNum(b.points) }),
-    el('td', { class: 'num', text: b.fail ? fmtNum(b.fail) : '—' }),
-  ])));
-}
-
-// ---------------------------------------------------------------- 模型
-
-$('#modelFilter').addEventListener('input', () => renderModels(state.models));
-
-async function loadModels() {
-  try {
-    const data = await api('/panel/api/models');
-    state.models = data.models || [];
-    renderModels(state.models);
-  } catch (e) {
-    toast(e.message, 'bad');
-  }
-}
-
-function renderModels(models) {
-  const kw = $('#modelFilter').value.trim().toLowerCase();
-  const list = kw ? models.filter((m) => (m.id + ' ' + (m.name || '')).toLowerCase().includes(kw)) : models;
-  const tbody = $('#mdBody');
+function renderAccounts(list) {
+  const tb = $('accBody');
   if (!list.length) {
-    tbody.replaceChildren(el('tr', {}, [el('td', { colspan: '7', class: 'empty', text: '没有匹配的模型' })]));
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
     return;
   }
-  tbody.replaceChildren(...list.map((m) => el('tr', {}, [
-    el('td', { class: 'num', text: m.id }),
-    el('td', { text: m.name || '—' }),
-    el('td', { class: 'num', text: m.multiplier ? 'x' + m.multiplier.toFixed(1) : '—' }),
-    el('td', { class: 'num', text: m.context_length ? fmtNum(m.context_length) : '—' }),
-    el('td', { class: 'num', text: m.max_output_tokens ? fmtNum(m.max_output_tokens) : '—' }),
-    el('td', { text: (m.capabilities || []).join(', ') || '—' }),
-    el('td', { text: (m.reasoning_efforts || []).join(', ') || '—' }),
-  ])));
+  const now = Date.now();
+  // 有可用余额 → 进度条按自身 剩余/池内最高；未知 → 空条。
+  const maxCred = Math.max(1, ...list.map(s => Number(s.available || 0)));
+  tb.innerHTML = list.map(s => {
+    const st = accountStatus(s, now);
+    const err = s.last_error ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.last_error) + '</div>' : '';
+    const locks = modelLocksHtml(s.model_cooldowns, now);
+    const avail = Number(s.available || 0);
+    const pct = Math.min(100, Math.round(avail / maxCred * 100));
+    // 额度口径 tooltip（抓包核对过的三分法）：每日登录后刷新 5000，扣费先活动后长期。
+    let credTip = '可用 ' + fmtPoints(avail);
+    if (s.permanent != null) credTip += '\n长期积分：' + fmtPoints(s.permanent);
+    if (s.daily_balance != null) credTip += '\n每日剩余：' + fmtPoints(s.daily_balance) +
+      (s.daily_quota ? ' / ' + fmtPoints(s.daily_quota) : '');
+    if (s.daily_cycle_date) credTip += '\n每日周期：' + s.daily_cycle_date + (s.checkin_done ? '（已签到）' : '（未签到）');
+    credTip += '\n更新于：' + (s.quota_updated_at ? ago(new Date(s.quota_updated_at * 1000).toISOString()) : '未刷新');
+    const tu = s.token_usage || {};
+    const req = tu.request_count || 0;
+    const latency = fmtMs(tu.last_latency_ms);
+    const usageTitle = '24h：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency;
+    const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
+    return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
+      '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) + '</div></td>' +
+      '<td>' + st.tag + err + locks + '</td>' +
+      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
+      (s.permanent != null && s.daily_balance != null
+        ? '<div class="id" style="font-size:11px">长期 ' + fmtPoints(s.permanent) + ' · 每日 ' + fmtPoints(s.daily_balance) + '</div>' : '') +
+      '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+      '<td class="num">' + (s.inflight || 0) + '</td>' +
+      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
+        '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
+        '<span class="usage-item usage-total"><b>' + fmtTok(tu.total_tokens) + '</b><em>tok</em></span>' +
+        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+      '</span></td>' +
+      '<td class="num" style="color:var(--ink-3)">' + days + '</td>' +
+      '<td class="acts">' +
+        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.name) + '">余额</button>' +
+        (s.has_password ? '<button class="xs ghost" data-a="login" data-u="' + esc(s.name) + '">登录</button>' : '') +
+        (s.disabled || s.in_cooldown || s.in_breaker
+          ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.name) + '">解冻</button>'
+          : (s.paused
+            ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.name) + '">恢复选号</button>'
+            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.name) + '" title="退出选号，但照常签到 / 刷新余额">暂停选号</button>')) +
+        (s.disabled ? '<button class="xs ghost" data-a="enable" data-u="' + esc(s.name) + '">启用</button>'
+                    : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.name) + '">禁用</button>') +
+        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.name) + '">移除</button>' +
+      '</td></tr>';
+  }).join('');
 }
 
-// ---------------------------------------------------------------- 日志
-
-$('#logFilter').addEventListener('input', debounce(loadRequests, 300));
-$('#logResult').addEventListener('change', loadRequests);
-
-function debounce(fn, ms) {
-  let t = null;
-  return function () {
-    clearTimeout(t);
-    t = setTimeout(fn, ms);
-  };
-}
-
-// 错误汇总：失败请求按 (账号 × 模型 × 状态) 聚合，最吵的排最前。
-async function loadErrors() {
-  try {
-    const data = await api('/panel/api/error_summary');
-    const rows = data.errors || [];
-    const tbody = $('#errBody');
-    $('#errNote').textContent = rows.length ? `${rows.length} 类` : '';
-    if (!rows.length) {
-      tbody.replaceChildren(el('tr', {}, [el('td', { colspan: '6', class: 'empty', text: '近 24 小时没有失败' })]));
-      return;
-    }
-    tbody.replaceChildren(...rows.map((e) => el('tr', { class: 'off' }, [
-      el('td', { class: 'num', text: e.account || '—' }),
-      el('td', { class: 'num', text: e.model || '—' }),
-      el('td', {}, [el('span', { class: 'tag bad', text: String(e.status) })]),
-      el('td', { class: 'num', text: fmtNum(e.count) }),
-      el('td', { class: 'num', text: e.last || '—' }),
-      el('td', { class: 'num', title: e.sample || null, text: (e.sample || '—').slice(0, 90) }),
-    ])));
-  } catch (err) {
-    toast(err.message, 'bad');
+// 模型锁池：账号池回答「哪些号不能用」，这张表回答「哪些模型不能用、还要锁多久」。
+// 数据来自 /overview 的 model_locks（pool.ModelLockView，Loomy 单域版），无锁时为 null。
+const ML_STATE = { locked: ['bad', '全池锁定'], starved: ['warn', '此刻无号'], partial: ['ok', '部分限流'] };
+function renderModelLocks(rows) {
+  const tb = $('mlBody');
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7" style="color:var(--ink-3)">没有模型处于锁定/限流</td></tr>';
+    $('mlNote').textContent = '';
+    return;
   }
+  const now = Date.now();
+  tb.innerHTML = list.map(r => {
+    const [cls, label] = ML_STATE[r.state] || ['mute', r.state];
+    return '<tr><td class="num">' + esc(r.model) + '</td>' +
+      '<td><span class="tag ' + cls + '">' + esc(label) + '</span></td>' +
+      '<td class="num">' + (r.servable || 0) + ' / ' + (r.total || 0) + '</td>' +
+      '<td class="num">' + (r.locked || 0) + '</td>' +
+      '<td class="num">' + esc(r.unlock_at ? fmtLocalDateTime(r.unlock_at * 1000) + '（' + dur((r.unlock_at * 1000 - now) / 1000) + '）' : '—') + '</td>' +
+      '<td class="num">' + esc(r.fully_unlock_at ? fmtLocalDateTime(r.fully_unlock_at * 1000) : '—') + '</td>' +
+      '<td class="clip" title="' + esc(r.reason || '') + '">' + esc(r.reason || '—') + '</td></tr>';
+  }).join('');
+  $('mlNote').textContent = list.length + ' 个模型受限';
 }
 
-async function loadRequests() {
-  const q = encodeURIComponent($('#logFilter').value.trim());
-  const result = $('#logResult').value;
+async function loadOverview(quiet) {
   try {
-    const data = await api(`/panel/api/requests?limit=200&q=${q}&result=${result}`);
-    const rows = data.records || [];
-    const tbody = $('#reqBody');
-    if (!rows.length) {
-      tbody.replaceChildren(el('tr', {}, [el('td', { colspan: '8', class: 'empty', text: '暂无请求记录' })]));
-      $('#reqSummary').textContent = '';
+    const d = await api('overview');
+    overviewData = d;
+    $('sTotal').textContent = d.total;
+    $('sHealthy').textContent = d.healthy;
+    $('sCooling').textContent = d.cooling;
+    $('sDisabled').textContent = d.disabled;
+    // 暂停选号单列（蓝本 issue #125）：它只关选号、照常保号，与禁用是两种状态。
+    $('sPaused').textContent = d.paused == null ? '-' : d.paused;
+    const availSum = (d.accounts || []).reduce((a, s) => a + (Number(s.available) || 0), 0);
+    $('sCredits').textContent = fmtPoints(availSum);
+    $('sSticky').textContent = d.sticky_sessions == null ? '-' : d.sticky_sessions;
+    $('navSub').textContent = 'v' + d.version;
+    $('navVer').textContent = 'v' + d.version;
+    // 上游只显示主机名：完整 URL 会把侧栏底部挤成两三行（截图实测）。
+    $('navUp').textContent = String(d.upstream || '').replace(/^https?:\/\//, '').split('/')[0];
+    $('navUp').title = d.upstream || '';
+    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
+    const p = $('navPulse');
+    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
+    const up = Math.floor(d.uptime_sec || 0);
+    $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    $('accNote').textContent = d.total ? d.total + ' 个账号' : '';
+    renderAccounts(d.accounts || []);
+    renderModelLocks(d.model_locks);
+  } catch (e) { if (!quiet) toast(e.message, 'err'); throw e; }
+}
+
+$('accBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-a]');
+  if (!b) return;
+  const u = b.dataset.u, a = b.dataset.a;
+  if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
+  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，也停止签到/刷额度（需手动启用）。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
+  b.disabled = true;
+  try {
+    if (a === 'checkin') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/checkin', { method: 'POST' });
+      const c = r.checkin || {};
+      toast(c.already_processed
+        ? '本周期已签到（每日 ' + fmtPoints((c.daily_quota || 0) - (c.daily_consumed || 0)) + '/' + fmtPoints(c.daily_quota) + '，可用 ' + fmtPoints(c.current_balance) + '）'
+        : '签到完成：已领每日 ' + fmtPoints(c.daily_quota) + '（可用 ' + fmtPoints(c.current_balance) + '）', 'ok');
+    } else if (a === 'balance') {
+      const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
+      const acc = r.account || {};
+      toast('余额已更新：' + fmtPoints(acc.available) + (acc.permanent != null ? '（长期 ' + fmtPoints(acc.permanent) + ' · 每日 ' + fmtPoints(acc.daily_balance) + '）' : ''), 'ok');
+    } else if (a === 'login') {
+      await api('accounts/' + encodeURIComponent(u) + '/login', { method: 'POST' });
+      toast(u + ' 登录成功（登录成功后已自动签到）', 'ok');
+    } else if (a === 'revive') {
+      await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
+      toast('已解冻', 'ok');
+    } else if (a === 'disable') {
+      await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
+      toast('已禁用', 'ok');
+    } else if (a === 'enable') {
+      await api('accounts/' + encodeURIComponent(u) + '/enable', { method: 'POST' });
+      toast('已启用', 'ok');
+    } else if (a === 'pause') {
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（签到 / 刷额度照常）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复选号', 'ok');
+    } else if (a === 'remove') {
+      await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
+      toast('已移除', 'ok');
+    }
+  } catch (e) { toast(e.message, 'err'); }
+  finally {
+    b.disabled = false;
+    invalidatePackages();
+    loadOverview(true);
+  }
+});
+
+$('btnCheckinAll').onclick = async () => {
+  const btn = $('btnCheckinAll');
+  btn.disabled = true;
+  try {
+    const d = await api('checkin_all', { method: 'POST' });
+    const rs = d.results || [];
+    const ok = rs.filter(r => r.ok).length;
+    const granted = rs.filter(r => r.granted).length;
+    toast('全部签到完成：成功 ' + ok + '/' + rs.length + (granted ? '，其中 ' + granted + ' 个新领额度' : '（均为本周期已领）'), 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; loadOverview(true); }
+};
+$('btnRefreshAll').onclick = async () => {
+  const btn = $('btnRefreshAll');
+  btn.disabled = true; btn.textContent = '刷新中…';
+  try {
+    const d = await api('refresh_all', { method: 'POST' });
+    const rs = d.results || [];
+    toast('额度刷新完成：' + rs.filter(r => r.ok).length + '/' + rs.length, 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '全部刷新额度'; loadOverview(true); }
+};
+$('btnLoginAll').onclick = async () => {
+  const btn = $('btnLoginAll');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const d = await api('login_all', { method: 'POST' });
+    const rs = d.results || [];
+    const ok = rs.filter(r => r.ok).length;
+    toast('全部重新登录：成功 ' + ok + ' / ' + rs.length + '（成功号已自动签到）', ok ? 'ok' : 'err');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '全部重新登录'; loadOverview(true); }
+};
+
+/* ── 模型 ─────────────────────────────────────────────────────────── */
+function fmtK(n) { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); }
+
+async function loadModels(force) {
+  const tb = $('mdBody');
+  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  try {
+    const d = await api('models' + (force ? '?refresh=1' : ''));
+    mdAll = d.models || [];
+    if (!mdAll.length) {
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型（池内需要至少一个有效登录态）</div></td></tr>';
+      $('mdCount').textContent = '';
+      $('mdNote').textContent = '上游未返回模型';
       return;
     }
-    const fails = rows.filter((r) => !(r.status >= 200 && r.status < 300)).length;
-    $('#reqSummary').textContent = `${rows.length} 条 · ${fails} 失败`;
-    tbody.replaceChildren(...rows.map((r) => {
-      const ok = r.status >= 200 && r.status < 300;
-      return el('tr', { class: ok ? '' : 'off' }, [
-        el('td', { class: 'num', text: fmtTime(r.t) }),
-        // 失败原因挂 title：不占列宽，hover 看到上游原文
-        el('td', {}, [el('span', { class: 'tag ' + (ok ? 'ok' : 'bad'), text: String(r.status), title: r.error || null })]),
-        el('td', { class: 'num', text: r.model || '—' }),
-        el('td', { class: 'num', text: r.account || '—' }),
-        el('td', { class: 'num', text: (r.ip || '—') + (r.ua ? ' · ' + r.ua.slice(0, 24) : '') }),
-        el('td', { class: 'num', text: fmtMs(r.latency_ms) }),
-        el('td', { class: 'num', text: fmtNum((r.prompt || 0) + (r.completion || 0)) }),
-        el('td', { class: 'num', text: fmtNum(r.points) }),
-      ]);
-    }));
+    $('mdNote').textContent = mdAll.length + ' 个模型';
+    renderModels();
   } catch (e) {
-    toast(e.message, 'bad');
+    mdAll = [];
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('mdCount').textContent = '';
   }
 }
 
-// 频道筛选：chat=对话请求行 / task=面板运维动作 / sys=其余（与后端 Ring 归类一致）
-let logCh = '';
-$('#logChips').addEventListener('click', (e) => {
-  const b = e.target.closest('.chip');
+/* ── 模型筛选（按条件查询）───────────────────────────────────────────
+   模型目录一次拉全，筛选与排序全部在前端完成：改条件零延迟，也不会因为调一次
+   筛选就打一次上游。条件之间是 AND；每个条件为空即不参与判定。 */
+function mdSearchText(m) {
+  return [m.id, m.name, (m.capabilities || []).join(' '), (m.reasoning_efforts || []).join(' ')]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+function mdMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const text = mdSearchText(m);
+    // 空格分词后逐个匹配：多关键词是 AND，便于"spark 视觉"这类组合查询。
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  if (f.cap === 'free' && !m.is_free) return false;
+  if (f.cap === 'tool' && !(m.capabilities || []).includes('function_calling') &&
+      !(m.capabilities || []).includes('tool')) return false;
+  if (f.cap === 'vision' && !(m.capabilities || []).includes('vision') &&
+      !(m.capabilities || []).includes('image')) return false;
+  if (f.cap === 'reasoning' && !(m.reasoning_efforts || []).length) return false;
+  if (f.cap === 'image' && (m.type || '') !== 'image') return false;
+  return true;
+}
+function mdSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'free') {
+    // 限免优先：同组内按倍率升序，方便一眼挑出「免费能用」的。
+    out.sort((a, b) => (Number(!!b.is_free) - Number(!!a.is_free)) || (num(a.multiplier) - num(b.multiplier)));
+  } else if (f.sort === 'rate') out.sort((a, b) => (num(a.multiplier) || Infinity) - (num(b.multiplier) || Infinity));
+  else if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  return out;
+}
+/* mdBaseName 去掉展示名里的「(x2.0)」「(限时免费)」标注：倍率与限免各有独立列，
+   名字里再重复一遍只会把行撑宽。上游没有结构化字段，只能在这里剥。 */
+function mdBaseName(name) {
+  return String(name || '')
+    .replace(/[（(]\s*[xX×]\s*[0-9]+(?:\.[0-9]+)?\s*[）)]/g, '')
+    .replace(/[（(]\s*限时免费\s*[）)]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function mdRowHtml(m) {
+  const eff = (m.reasoning_efforts || []);
+  const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+    : '<span style="color:var(--ink-3);font-size:12.5px">不支持思考</span>';
+  const caps = [];
+  for (const c of (m.capabilities || [])) {
+    caps.push('<span class="tag mute">' + esc(c) + '</span>');
+  }
+  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  // 倍率列：限免模型显示「限时免费」标签（上游倍率为 0，直接写 x0.0 反而看不出是优惠）。
+  const rate = m.is_free
+    ? '<span class="tag ok" title="上游标注限时免费，倍率 0">限免</span>'
+    : (m.multiplier ? 'x' + Number(m.multiplier).toFixed(1) : '—');
+  const defTag = m.is_default_model ? '<span class="tag ok" title="上游默认模型">默认</span>' : '';
+  const typeTag = (m.type === 'image') ? '<span class="tag mute">图像</span>' : '';
+  const dflt = m.default_reasoning_effort ? '<div class="id">默认档 ' + esc(m.default_reasoning_effort) + '</div>' : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
+    '<td class="who"><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + defTag + typeTag + '</div>' +
+    '<div class="id">' + esc(mdBaseName(m.name) || '') + '</div>' + capHtml + '</td>' +
+    '<td class="num">' + rate + '</td>' +
+    '<td class="num">' + (m.context_length ? fmtK(m.context_length) : '—') + '</td>' +
+    '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>' +
+    '<td class="efs" style="white-space:normal">' + effs + dflt + '</td></tr>';
+}
+function renderModels() {
+  const tb = $('mdBody');
+  const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+  } else {
+    tb.innerHTML = list.map(mdRowHtml).join('');
+  }
+  // 限免数单独报出来：这是「现在用哪个模型不花积分」的直接答案。
+  const freeCount = mdAll.filter(m => m.is_free).length;
+  const filtered = list.length !== mdAll.length;
+  $('mdCount').textContent = !mdAll.length ? ''
+    : (filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
+    : mdAll.length + ' 个模型') + (freeCount ? ' · 限免 ' + freeCount : '');
+  $('mdCount').className = filtered ? 'note src-off' : 'note';
+}
+function resetModelFilter() {
+  mdFilter = { q: '', cap: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdCap').value = ''; $('mdSort').value = 'default';
+  renderModels();
+}
+
+// 筛选控件：输入框防抖 120ms（长列表逐字符重排不必每键一次），下拉即时。
+let mdQTimer = null;
+$('mdQ').oninput = () => {
+  clearTimeout(mdQTimer);
+  mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
+};
+for (const [id, key] of [['mdCap', 'cap'], ['mdSort', 'sort']]) {
+  const el = $(id);
+  if (!el) continue;
+  el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
+}
+$('mdReset').onclick = resetModelFilter;
+$('btnModels').onclick = () => loadModels(true);
+
+/* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
+let logCh = 'all';
+$('logChips').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-ch]');
   if (!b) return;
   logCh = b.dataset.ch;
-  $$('#logChips .chip').forEach((x) => x.classList.toggle('on', x === b));
-  loadServiceLogs();
+  document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
+  loadLogs();
 });
+// logLevel 日志行的颜色级别。先抹掉「空赋值」字段再判：
+// `error=""`（值为空 = 这一项没有错误）里带 error 字样，裸匹配会把成功的行
+// 整行标红；非空赋值（`error="task failed"`）仍然照常标红。
+function logLevel(text) {
+  const t = String(text == null ? '' : text).replace(/\b[a-z_]+=(?:""|'')/gi, '');
+  if (/error|失败|错误|⚠️/.test(t)) return ' e';
+  if (/warn|冷却|熔断|限流/.test(t)) return ' w';
+  return '';
+}
 
-const CH_NAME = { chat: '对话', task: '任务', sys: '系统' };
-
-async function loadServiceLogs() {
+async function loadLogs() {
+  const box = $('logBox');
+  const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  const limit = $('reqLimit').value || 100;
+  // 时间范围由服务端过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
+  // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
+  const rq = trangeQuery('reqRange', false);
+  rq.set('limit', limit);
   try {
-    const data = await api('/panel/api/logs');
-    const box = $('#logBox');
-    const list = (data.entries || []).filter((x) => !logCh || x.ch === logCh);
-    box.replaceChildren(...(list.length
-      ? list.map((x) => el('span', { class: 'ln' + (/\b(失败|错误|error)\b/i.test(x.text) ? ' e' : '') }, [
-        el('i', { class: 'lch ' + x.ch, text: CH_NAME[x.ch] || x.ch }),
-        el('span', { text: hhmmss(x.ts) + ' ' + x.text }),
-      ]))
-      : [el('span', { class: 'ln', text: '（该频道暂无日志）' })]));
-    if ($('#logAutoscroll').checked) box.scrollTop = box.scrollHeight;
-  } catch (e) {
-    /* 日志页不阻断使用 */
-  }
+    const [d, requestRows, errSum, credit] = await Promise.all([
+      api('logs'),
+      api('requests?' + rq.toString()).catch(() => ({ records: [] })),
+      api('error_summary').catch(() => null),
+      api('credit_history?limit=' + creditLimitValue()).catch(() => null),
+    ]);
+    renderRequests(requestRows.records || []);
+    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
+    box.innerHTML = entries.length
+      ? entries.map(e => {
+        const lvl = logLevel(e.text);
+        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
+        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+      }).join('')
+      : '<span style="color:var(--ink-3)">暂无日志</span>';
+    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
+    const counts = {};
+    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
+    $('logNote').textContent = logCh === 'all'
+      ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
+      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+    renderErrorSummary(errSum);
+    renderCreditHistory(credit);
+  } catch (e) { /* 概览已提示 */ }
 }
 
-function hhmmss(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const p = (n) => String(n).padStart(2, '0');
-  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-}
-
-// ---------------------------------------------------------------- 配置
-
-const CONFIG_FIELDS = [
-  { title: '基础', fields: [
-    { key: 'listen', label: '监听地址', type: 'text' },
-    { key: 'default_model', label: '默认模型', type: 'text' },
-    { key: 'upstream', label: '上游 base URL', type: 'text', restart: true },
-    { key: 'account_base', label: '账号服务 URL', type: 'text', restart: true },
-    { key: 'proxy', label: '全局代理', type: 'text' },
-    { key: 'loomy_version', label: 'loomy-version 头', type: 'text' },
-  ] },
-  { title: '鉴权', fields: [
-    { key: 'panel_password', label: '面板密码（留空 = 用 api_key）', type: 'password' },
-  ] },
-  { title: '账号池', fields: [
-    { key: 'strategy', label: '选号策略 (weighted / round_robin / balance / lru)', type: 'text' },
-    { key: 'pick_top_n', label: 'Top-N 短名单', type: 'number' },
-    { key: 'max_inflight_per_account', label: '单账号在途上限 (0 = 不限)', type: 'number' },
-    { key: 'balance_floor', label: '积分保底 (0 = 关闭)', type: 'number' },
-    { key: 'sticky_ttl_seconds', label: '会话粘性 TTL (秒)', type: 'number' },
-    { key: 'sticky_max_entries', label: '粘性表容量', type: 'number' },
-  ] },
-  { title: '冷却与熔断', fields: [
-    { key: 'soft_rate_base_seconds', label: '软冷却基数 (秒)', type: 'number' },
-    { key: 'soft_rate_max_seconds', label: '软冷却封顶 (秒)', type: 'number' },
-    { key: 'not_found_cooldown_seconds', label: '404 冷却 (秒)', type: 'number' },
-    { key: 'breaker_threshold', label: '熔断阈值 (连败次数)', type: 'number' },
-    { key: 'breaker_cooldown_seconds', label: '熔断基数 (秒)', type: 'number' },
-    { key: 'breaker_cooldown_max_seconds', label: '熔断封顶 (秒)', type: 'number' },
-  ] },
-  { title: '上游与请求', fields: [
-    { key: 'timeout_seconds', label: '短 RPC 超时 (秒)', type: 'number' },
-    { key: 'max_retries', label: '换号重试次数', type: 'number' },
-    { key: 'keepalive_min_tokens', label: '长任务阈值 (max_tokens)', type: 'number' },
-    { key: 'quota_refresh_minutes', label: '额度刷新间隔 (分)', type: 'number' },
-    { key: 'session_renew_before_days', label: '提前续期天数', type: 'number' },
-  ] },
-  { title: '日志', fields: [
-    { key: 'log_requests', label: '记录请求日志', type: 'bool' },
-    { key: 'log_client_info', label: '记录调用来源 (IP / UA)', type: 'bool' },
-    { key: 'usage_max_entries', label: '台账内存条数', type: 'number' },
-    { key: 'strip_model_prefix', label: '自动补 imodel/ 前缀', type: 'bool' },
-  ] },
-];
-
-async function loadConfig() {
-  if (state.cfg) return;
-  try {
-    const data = await api('/panel/api/config');
-    state.cfg = data.config || {};
-    $('#cfgPath').textContent = data.path || '';
-    renderConfig(state.cfg);
-  } catch (e) {
-    toast(e.message, 'bad');
-  }
-}
-
-function renderConfig(cfg) {
-  $('#cfgForm').replaceChildren(...CONFIG_FIELDS.map((g) => el('fieldset', {}, [
-    el('legend', { text: g.title }),
-    el('div', { class: 'grid2' }, g.fields.map((f) => {
-      const v = cfg[f.key];
-      if (f.type === 'bool') {
-        const box = el('input', { type: 'checkbox', name: f.key });
-        box.checked = !!v;
-        return el('label', { class: 'switch' }, [el('span', { class: 'lb', text: f.label }), box]);
-      }
-      const shown = f.type === 'password' && v ? '' : (v === undefined || v === null ? '' : String(v));
-      const input = el('input', {
-        name: f.key,
-        type: f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text',
-        value: shown,
-      });
-      const hint = f.type === 'password' && v ? '已设置；留空表示不修改' : (f.restart ? '改动后需重启进程' : null);
-      return el('label', { class: 'fld' }, [
-        el('span', { class: 'lb', text: f.label }),
-        input,
-        hint ? el('span', { class: 'hint', text: hint }) : null,
-      ]);
-    })),
-    el('div', { class: 'hr' }),
-  ])));
-}
-
-$('#btnSaveCfg').addEventListener('click', async () => {
-  const form = $('#cfgForm');
-  const patch = {};
-  for (const g of CONFIG_FIELDS) {
-    for (const f of g.fields) {
-      const input = form.querySelector(`[name="${f.key}"]`);
-      if (!input) continue;
-      if (f.type === 'bool') patch[f.key] = input.checked;
-      else if (f.type === 'number') {
-        const n = Number(input.value);
-        if (input.value !== '' && !Number.isNaN(n)) patch[f.key] = n;
-      } else {
-        const v = input.value.trim();
-        if (f.type === 'password' && v === '') continue; // 留空 = 不改
-        patch[f.key] = v;
-      }
+// reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
+// outcome 精确匹配。两者都在已拉取的条目上做（最多 2000 条），不发新请求。
+function reqMatch(e, f) {
+  f = f || reqFilter;
+  const ok = Number(e && e.status || 0) >= 200 && Number(e && e.status || 0) < 300;
+  if (f.outcome === 'ok' && !ok) return false;
+  if (f.outcome === 'fail' && ok) return false;
+  if (f.q) {
+    const text = [e && e.ip, e && e.ua, e && e.model, e && e.account, e && e.rid, e && e.error]
+      .filter(Boolean).join(' ').toLowerCase();
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
     }
   }
-  try {
-    const res = await api('/panel/api/config', { method: 'POST', body: patch });
-    $('#cfgNote').textContent = res.message || '已保存';
-    toast('配置已保存', 'ok');
-    state.cfg = null;
-    await refreshAll();
-    await loadConfig();
-  } catch (e) {
-    toast(e.message, 'bad');
-  }
-});
+  return true;
+}
+function reqOutcomeTag(e) {
+  const ok = Number(e && e.status || 0) >= 200 && Number(e && e.status || 0) < 300;
+  const label = ok ? '成功' : 'HTTP ' + (e && e.status || '—');
+  const cls = ok ? 'ok' : 'bad';
+  return '<span class="tag ' + cls + '" title="' + esc(e && e.error || '') + '">' + esc(String(e && e.status || '—') + ' ' + label) + '</span>';
+}
+function requestLogText(e) {
+  const when = e && e.t ? new Date(e.t * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const ok = Number(e && e.status || 0) >= 200 && Number(e && e.status || 0) < 300;
+  const tok = Number(e && e.prompt || 0) + Number(e && e.completion || 0);
+  return [when, (e && e.status || '—') + (ok ? ' 成功' : ' 失败'), e && e.model || '—', e && e.account || '—',
+    e && e.ip || '—', e && e.ua || '—', fmtMs(e && e.latency_ms), fmtTok(tok) + ' tok',
+    e && e.points ? fmtPoints(e.points) + ' 积分' : '', e && e.ttfb_ms ? 'TTFB ' + fmtMs(e.ttfb_ms) : '',
+    e && e.rid || '—'].filter(Boolean).join(' | ');
+}
+function renderRequestTable() {
+  const list = reqEntries.filter(e => reqMatch(e));
+  const tb = $('reqBody');
+  tb.innerHTML = list.map(e => {
+    const when = e && e.t ? new Date(e.t * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
+    const ip = e && e.ip ? e.ip : '';
+    const ua = e && e.ua ? e.ua : '';
+    const rid = e && e.rid ? e.rid : '';
+    return '<tr title="' + esc(requestLogText(e)) + '">' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + fmtMs(e && e.latency_ms) + '</td>' +
+      '<td class="num">' + fmtTok(Number(e && e.prompt || 0) + Number(e && e.completion || 0)) + '</td>' +
+      '<td class="num">' + (e && e.points ? fmtPoints(e.points) : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">' +
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
-// ---------------------------------------------------------------- 轮询
-
-function startPolling() {
-  if (state.timer) clearInterval(state.timer);
-  state.timer = setInterval(() => {
-    if (document.hidden) return;
-    if (state.view === 'accounts') refreshAll().catch(() => {});
-    else if (state.view === 'logs') loadServiceLogs();
-  }, 5000);
+  const filtered = list.length !== reqEntries.length;
+  const hasSource = reqEntries.some(e => e && (e.ip || e.ua));
+  $('reqCount').textContent = !reqEntries.length ? ''
+    : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
+      (hasSource ? '' : ' · 来源未记录');
+  $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+}
+function renderRequests(records) {
+  reqEntries = records || [];
+  // reqStats：请求指标行（本页窗口内计算，避免再打一次聚合端点）。
+  const rows = reqEntries;
+  const okCount = rows.filter(e => Number(e.status || 0) >= 200 && Number(e.status || 0) < 300).length;
+  const tokSum = rows.reduce((n, e) => n + Number(e.prompt || 0) + Number(e.completion || 0), 0);
+  const latSum = rows.reduce((n, e) => n + Number(e.latency_ms || 0), 0);
+  const ptsSum = rows.reduce((n, e) => n + Number(e.points || 0), 0);
+  const rate = rows.length ? (okCount / rows.length * 100) : null;
+  $('reqStats').innerHTML =
+    usStat(fmtTok(rows.length), '请求') +
+    usStat(rate == null ? '—' : rate.toFixed(1) + '%', '成功率') +
+    usStat(fmtTok(tokSum), 'Token') +
+    usStat(fmtPoints(ptsSum), '积分') +
+    usStat(rows.length ? fmtMs(latSum / rows.length) : '—', '平均延迟') +
+    usStat(String(rows.length - okCount), '失败');
+  $('reqNote').textContent = '内存台账 · 最近 ' + rows.length + ' 条';
+  renderRequestTable();
 }
 
-// ---------------------------------------------------------------- 启动
+/* 错误汇总（后端 /panel/api/error_summary 已聚合+排序）：只渲染，不在这里再算。 */
+function renderErrorSummary(d) {
+  const rows = (d && d.errors) || [];
+  $('errBody').innerHTML = rows.length ? rows.map(r => {
+    const sev = r.status >= 500 ? 'lv-e' : r.status === 429 ? 'lv-w' : '';
+    return '<tr class="' + sev + '">' +
+      '<td>' + esc(r.account || '—') + '</td>' +
+      '<td>' + esc(String(r.status || '—')) + '</td>' +
+      '<td>' + esc(r.model || '—') + '</td>' +
+      '<td class="num">' + (r.count || 0) + '</td>' +
+      '<td>' + esc(r.last || '—') + '</td>' +
+      '<td class="sample" title="' + esc(r.sample || '') + '">' + esc(r.sample || '') + '</td></tr>';
+  }).join('') : '<tr><td colspan="6" style="color:var(--ink-3)">窗口内没有失败请求</td></tr>';
+  $('errNote').textContent = d
+    ? rows.length + ' 类 · 统计窗口 24h'
+    : '—';
+}
 
-(async function boot() {
-  const v = location.hash.replace('#', '');
-  if (TITLES[v]) switchView(v);
-  try {
-    await refreshAll();
-    loadView(state.view);
-  } catch (e) {
-    openKey();
+/* ── 积分历史（上游 points/records 流水账本，跨账号按时间混排）─────────
+   纯格式化函数集中在此，便于前端测试按切片断言；变动列 +N / −N（U+2212）。 */
+function creditTimeText(e) {
+  if (!e || !e.time) return '—';
+  const d = new Date(e.time);
+  // 正常链路 time 由 Go 序列化成 RFC3339；这里挡的是手工改文件/换格式等脏数据。
+  return isNaN(d.getTime()) ? '—' : d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+function creditDeltaText(delta) {
+  const d = Number(delta || 0);
+  if (d > 0) return '+' + fmtPoints(d);
+  if (d < 0) return '−' + fmtPoints(-d);
+  return '0';
+}
+function creditDescText(e) {
+  const bits = [e && e.desc, e && e.model, e && e.source].filter(Boolean);
+  return (bits.length ? bits.join(' · ') : '') + ' | 余额 ' + fmtPoints(e && e.before) + ' → ' + fmtPoints(e && e.after);
+}
+function creditEntryText(e) {
+  return creditTimeText(e) + ' | ' + (e && e.account || '—') + ' | ' + creditDeltaText(e && e.delta) +
+    ' | ' + fmtPoints(e && e.after) + ' | ' + creditDescText(e);
+}
+function creditHistoryNote(entries) {
+  entries = entries || [];
+  if (!entries.length) return '暂无积分流水';
+  let net = 0;
+  for (const e of entries) net += Number(e && e.delta || 0);
+  return entries.length + ' 条 · 净 ' + (net > 0 ? '+' : net < 0 ? '−' : '') + fmtPoints(Math.abs(net));
+}
+function renderCreditHistory(d) {
+  const body = $('creditBody'), note = $('creditNote');
+  if (!d) {
+    note.textContent = '积分历史不可用';
+    body.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">积分历史不可用</td></tr>';
+    return;
   }
-  startPolling();
-})();
+  const entries = d.entries || [];
+  note.textContent = creditHistoryNote(entries);
+  body.innerHTML = entries.length
+    ? entries.map(e => '<tr title="' + esc(creditEntryText(e)) + '">' +
+      '<td>' + esc(creditTimeText(e)) + '</td>' +
+      '<td>' + esc(e.account || '—') + '</td>' +
+      '<td class="num">' + esc(creditDeltaText(e.delta)) + '</td>' +
+      '<td class="num">' + esc(fmtPoints(e.after)) + '</td>' +
+      '<td class="clip" title="' + esc(creditDescText(e)) + '">' + esc(creditDescText(e)) + '</td>' +
+      '</tr>').join('')
+    : '<tr><td colspan="5" style="color:var(--ink-3)">暂无积分流水（新注册账号只有首登 5000，消耗后才有流水）</td></tr>';
+}
+function creditLimitValue() {
+  const n = Number($('creditLimit').value);
+  return n === 300 || n === 1000 ? n : 100;
+}
+async function loadCreditHistory() {
+  let d = null;
+  try { d = await api('credit_history?limit=' + creditLimitValue()); } catch (e) { d = null; }
+  renderCreditHistory(d);
+}
+
+// 请求记录筛选控件。搜索框防抖 150ms。
+let reqQTimer = null;
+$('reqQ').oninput = () => {
+  clearTimeout(reqQTimer);
+  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); renderRequestTable(); }, 150);
+};
+$('reqOutcome').onchange = () => {
+  reqFilter.outcome = $('reqOutcome').value;
+  renderRequestTable();
+};
+$('reqLimit').onchange = loadLogs;
+$('btnReqReload').onclick = loadLogs;
+// 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
+// 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
+trangeBind('reqRange', loadLogs, '0');
+$('creditLimit').onchange = loadCreditHistory;
+$('btnCreditReload').onclick = loadCreditHistory;
+
+$('btnLogPin').onclick = () => {
+  logPin = !logPin;
+  $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
+};
+
+/* ── 配置 ─────────────────────────────────────────────────────────── */
+/* CFG_MAP：面板字段 → config.json 键。Loomy 配置是扁平 JSON（蓝本是嵌套分组），
+   直接键名映射；api_keys / panel_password 走专用控件（脱敏值不下发，见下）。 */
+const CFG_MAP = {
+  listen: 'listen', default_model: 'default_model', strategy: 'strategy',
+  pick_top_n: 'pick_top_n', max_inflight_per_account: 'max_inflight_per_account',
+  balance_floor: 'balance_floor',
+  sticky_ttl_seconds: 'sticky_ttl_seconds', sticky_max_entries: 'sticky_max_entries',
+  sessions_from_client: 'sessions_from_client', identity_mode: 'identity_mode',
+  quota_refresh_minutes: 'quota_refresh_minutes',
+  session_renew_before_days: 'session_renew_before_days',
+  keepalive_min_tokens: 'keepalive_min_tokens',
+  soft_rate_base_seconds: 'soft_rate_base_seconds', soft_rate_max_seconds: 'soft_rate_max_seconds',
+  cooldown_seconds: 'cooldown_seconds', not_found_cooldown_seconds: 'not_found_cooldown_seconds',
+  breaker_threshold: 'breaker_threshold',
+  breaker_cooldown_seconds: 'breaker_cooldown_seconds',
+  breaker_cooldown_max_seconds: 'breaker_cooldown_max_seconds',
+  timeout_seconds: 'timeout_seconds', max_retries: 'max_retries',
+  usage_max_entries: 'usage_max_entries',
+  upstream: 'upstream', account_base: 'account_base', account_appid: 'account_appid',
+  access_key_id: 'access_key_id', access_key_secret: 'access_key_secret',
+  loomy_version: 'loomy_version', proxy: 'proxy',
+  auth_dir: 'auth_dir', state_file: 'state_file', log_dir: 'log_dir',
+  strip_model_prefix: 'strip_model_prefix',
+  log_requests: 'log_requests', log_client_info: 'log_client_info',
+};
+const NUM_FIELDS = ['pick_top_n', 'max_inflight_per_account', 'balance_floor', 'sticky_ttl_seconds',
+  'sticky_max_entries', 'quota_refresh_minutes', 'session_renew_before_days', 'keepalive_min_tokens',
+  'soft_rate_base_seconds', 'soft_rate_max_seconds', 'cooldown_seconds', 'not_found_cooldown_seconds',
+  'breaker_threshold', 'breaker_cooldown_seconds', 'breaker_cooldown_max_seconds',
+  'timeout_seconds', 'max_retries', 'usage_max_entries'];
+// 保存后本机密钥可能要换（追加了新 key）：collectConfig 里把控件值透传后端。
+function isMasked(v) { return typeof v === 'string' && v.indexOf('已设置') >= 0; }
+
+async function loadConfig() {
+  try {
+    const d = await api('config');
+    cfgLoaded = d.config || {};
+    $('cfgPath').textContent = d.path || '';
+    const f = $('cfgForm');
+    for (const [name, key] of Object.entries(CFG_MAP)) {
+      const el = f.elements[name];
+      if (!el) continue;
+      const v = cfgLoaded[key];
+      if (el.type === 'checkbox') el.checked = !!v;
+      else el.value = v == null ? '' : v;
+    }
+    $('cfgNote').textContent = '';
+  } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
+}
+function collectConfig() {
+  const f = $('cfgForm'), out = {};
+  for (const [name, key] of Object.entries(CFG_MAP)) {
+    const el = f.elements[name];
+    if (!el) continue;
+    if (el.type === 'checkbox') { out[key] = el.checked; continue; }
+    const raw = el.value.trim();
+    if (raw === '' || isMasked(raw)) continue; // 空 / 脱敏值 = 不修改（防误清空，蓝本同款保护）
+    if (NUM_FIELDS.includes(name)) {
+      const n = Number(raw);
+      if (Number.isFinite(n)) out[key] = n;
+    } else out[key] = raw;
+  }
+  const extraKey = ($('cfgApiKey') && $('cfgApiKey').value || '').trim();
+  // 服务端读到的是脱敏列表，前端无法回传原文——_add_api_key 由后端合并进 api_keys。
+  if (extraKey) out._add_api_key = extraKey;
+  const pp = ($('cfgPanelPass') && $('cfgPanelPass').value || '').trim();
+  if (pp && !isMasked(pp)) out.panel_password = pp;
+  return out;
+}
+// 数值字段即时校验：非空必须是有限数（保存被拒不如就地标红）。
+function markNumberFields() {
+  const f = $('cfgForm');
+  for (const name of NUM_FIELDS) {
+    const el = f.elements[name];
+    if (!el) continue;
+    const v = el.value.trim();
+    const bad = v !== '' && !Number.isFinite(Number(v));
+    el.classList.toggle('invalid', bad);
+    el.title = bad ? '必须是数字' : '';
+  }
+}
+$('cfgForm').addEventListener('input', ev => {
+  if (NUM_FIELDS.includes(ev.target.name)) markNumberFields();
+});
+$('btnCfgReload').onclick = loadConfig;
+$('cfgForm').onsubmit = async ev => {
+  ev.preventDefault();
+  markNumberFields();
+  const f = $('cfgForm');
+  const firstBad = NUM_FIELDS.find(n => {
+    const el = f.elements[n];
+    return el && el.value.trim() !== '' && !Number.isFinite(Number(el.value));
+  });
+  if (firstBad) {
+    f.elements[firstBad].focus();
+    toast('「' + firstBad + '」必须是数字', 'err');
+    return;
+  }
+  const btn = $('btnCfgSave');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    const patch = collectConfig();
+    const r = await api('config', { method: 'POST', body: JSON.stringify(patch) });
+    const fields = r.restart_required || [];
+    toast(r.message || (fields.length ? '配置已保存，其中 ' + fields.length + ' 项需重启进程生效' : '配置已保存并立即生效'), 'ok');
+    const k = ($('cfgApiKey') && $('cfgApiKey').value || '').trim();
+    if (k) localStorage.setItem(LS_KEY, k); // 追加成功后用新密钥继续持有本机凭据
+    await loadConfig();
+    $('cfgNote').textContent = fields.length ? '需重启生效：' + fields.join('、') : '';
+    loadOverview(true);
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存配置'; }
+};
+
+/* ── 添加账号（密码 / 短信验证码 / 导入 JSON）──────────────────────── */
+function openAdd() {
+  $('addVeil').classList.add('on');
+  switchAddTab('password');
+}
+function switchAddTab(tab) {
+  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('addTabPwd').hidden = tab !== 'password';
+  $('addTabSms').hidden = tab !== 'sms';
+  $('addTabImport').hidden = tab !== 'import';
+  $('btnAddSave').hidden = tab !== 'password';
+  $('btnSmsSend').hidden = tab !== 'sms';
+  $('btnSmsLogin').hidden = tab !== 'sms';
+  $('btnImportFile').hidden = tab !== 'import';
+  ['addPwdDone', 'addPwdErr', 'addSmsDone', 'addSmsErr', 'addImportErr', 'addImportDone']
+    .forEach(id => { $(id).hidden = true; });
+}
+document.querySelectorAll('#addTabs .tab').forEach(b => {
+  b.onclick = () => switchAddTab(b.dataset.tab);
+});
+$('btnCloseAdd').onclick = () => $('addVeil').classList.remove('on');
+
+$('btnAddSave').onclick = async () => {
+  const f = $('addTabPwd');
+  const body = {
+    name: (f.querySelector('[name=addName]').value || '').trim(),
+    loginid: (f.querySelector('[name=addLogin]').value || '').trim(),
+    password: f.querySelector('[name=addPassword]').value || '',
+    proxy: (f.querySelector('[name=addProxy]').value || '').trim(),
+    login: f.querySelector('[name=addLoginNow]').checked,
+  };
+  if (!body.loginid || !body.password) { toast('需要手机号 + 密码（可先不勾选「立即登录」只存凭证）', 'err'); return; }
+  const btn = $('btnAddSave'); btn.disabled = true;
+  $('addPwdErr').hidden = true; $('addPwdDone').hidden = true;
+  try {
+    await api('accounts', { method: 'POST', body: JSON.stringify(body) });
+    $('addPwdDone').hidden = false;
+    $('addPwdDone').textContent = '已添加 ' + (body.name || body.loginid) + (body.login ? '（已登录 + 自动签到）' : '（凭证已入池）');
+    f.querySelector('[name=addPassword]').value = '';
+    invalidatePackages();
+    setTimeout(() => { $('addVeil').classList.remove('on'); loadOverview(true); }, 1400);
+  } catch (e) {
+    $('addPwdErr').hidden = false;
+    $('addPwdErr').textContent = e.message;
+  } finally { btn.disabled = false; }
+};
+
+$('btnSmsSend').onclick = async () => {
+  const f = $('addTabSms');
+  const body = {
+    name: (f.querySelector('[name=smsName]').value || '').trim(),
+    phone: (f.querySelector('[name=smsPhone]').value || '').trim(),
+  };
+  if (!body.phone) { toast('需要手机号', 'err'); return; }
+  const btn = $('btnSmsSend'); btn.disabled = true; btn.textContent = '发送中…';
+  $('addSmsErr').hidden = true; $('addSmsDone').hidden = true;
+  try {
+    const r = await api('sms/send', { method: 'POST', body: JSON.stringify(body) });
+    smsMsgID = r.msg_id || '';
+    $('addSmsDone').hidden = false;
+    $('addSmsDone').textContent = '验证码已发送到 ' + body.phone + '；收到后填码点「登录」';
+  } catch (e) {
+    $('addSmsErr').hidden = false;
+    $('addSmsErr').textContent = '发送失败：' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = '发送验证码';
+  }
+};
+$('btnSmsLogin').onclick = async () => {
+  const f = $('addTabSms');
+  const body = {
+    name: (f.querySelector('[name=smsName]').value || '').trim(),
+    phone: (f.querySelector('[name=smsPhone]').value || '').trim(),
+    code: (f.querySelector('[name=smsCode]').value || '').trim(),
+    msg_id: smsMsgID,
+  };
+  if (!body.phone || !body.code) { toast('需要手机号与验证码', 'err'); return; }
+  const btn = $('btnSmsLogin'); btn.disabled = true;
+  $('addSmsErr').hidden = true; $('addSmsDone').hidden = true;
+  try {
+    const r = await api('sms/login', { method: 'POST', body: JSON.stringify(body) });
+    $('addSmsDone').hidden = false;
+    $('addSmsDone').textContent = '已登录并加入池：' + (r.account && r.account.name || body.name) + '（已自动签到）';
+    invalidatePackages();
+    setTimeout(() => { $('addVeil').classList.remove('on'); loadOverview(true); }, 1400);
+  } catch (e) {
+    $('addSmsErr').hidden = false;
+    $('addSmsErr').textContent = '登录失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
+
+$('btnImportFile').onclick = async () => {
+  const file = $('importFile').files[0];
+  if (!file) { toast('先选择一个 JSON 文件', 'err'); return; }
+  const btn = $('btnImportFile'); btn.disabled = true;
+  $('addImportErr').hidden = true; $('addImportDone').hidden = true;
+  try {
+    const parsed = JSON.parse(await file.text());
+    const arr = Array.isArray(parsed) ? parsed : [parsed];
+    let ok = 0; const errs = [];
+    for (const it of arr) {
+      try {
+        await api('accounts', { method: 'POST', body: JSON.stringify(it) });
+        ok++;
+      } catch (e) { errs.push((it && it.name || '?') + '：' + e.message); }
+    }
+    $('addImportDone').hidden = false;
+    $('addImportDone').textContent = '导入完成：成功 ' + ok + ' 个' + (errs.length ? '，失败 ' + errs.length + ' 个' : '');
+    if (errs.length) $('addImportErr').hidden = false, $('addImportErr').textContent = errs.join('；');
+    invalidatePackages();
+    loadOverview(true);
+  } catch (e) {
+    $('addImportErr').hidden = false;
+    $('addImportErr').textContent = '导入失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
+
+/* ── 顶部动作 ─────────────────────────────────────────────────────── */
+$('btnAdd').onclick = openAdd;
+$('btnRefresh').onclick = async () => {
+  const b = $('btnRefresh');
+  b.disabled = true; b.title = '刷新中…';
+  try {
+    await api('refresh_all', { method: 'POST' });
+    await loadOverview(true);
+    toast('额度已从上游刷新', 'ok');
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
+  finally { b.disabled = false; b.title = '刷新'; }
+  if (view === 'logs') loadLogs();
+};
+
+/* ── 轮询 ─────────────────────────────────────────────────────────── */
+function refreshVisible() {
+  if (view === 'accounts') loadOverview(true);
+  else if (view === 'logs') loadLogs();
+}
+function start() {
+  loadOverview(true).catch(() => {});
+  if (refTimer) clearInterval(refTimer);
+  refTimer = setInterval(refreshVisible, 5000);
+}
+start();
+
+/* ── 用量 ─────────────────────────────────────────────────────────── */
+/* 图表用原生 SVG 手绘：面板是 go:embed 单文件、无构建步骤，引入图表库
+   就得带上打包器，得不偿失。这里只需要堆叠柱状图，几十行足够。 */
+function usStat(v, k, cls) {
+  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
+         '</div><div class="k">' + esc(k) + '</div></div>';
+}
+/* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub）。 */
+function usKpi(v, k, cls, sub, bar) {
+  return '<div class="kpi ' + (cls || '') + '">' +
+    '<div class="k">' + esc(k) + '</div>' +
+    '<div class="v">' + esc(v) + '</div>' +
+    (bar || '') +
+    (sub ? '<div class="s">' + esc(sub) + '</div>' : '') +
+    '</div>';
+}
+/* usMixBar prompt/completion 占比条。宽度按百分比而不是固定像素：表列宽随窗口变化，
+   像素宽度在窄屏会溢出、宽屏又显得没信息。 */
+function usMixBar(prompt, completion, total) {
+  const t = Number(total || 0);
+  if (!t) return '';
+  const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
+  const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
+  return '<span class="us-mix" title="prompt ' + pp.toFixed(1) + '% · completion ' + pc.toFixed(1) + '%">' +
+    '<i class="p" style="width:' + pp.toFixed(2) + '%"></i>' +
+    '<i class="c" style="width:' + pc.toFixed(2) + '%"></i>' +
+    '</span>';
+}
+/* usPct 占比文案（0 值不显示 "0.0%"，直接 —，避免一行全是零）。 */
+function usPct(part, total) {
+  const t = Number(total || 0);
+  if (!t) return '—';
+  return (Number(part || 0) / t * 100).toFixed(1) + '%';
+}
+
+/* 归一化后端用量响应：/panel/api/usage 返回 {window, hourly}，蓝本渲染层要的是
+   totals + by_* 数组 + series。在这里做一层适配，前端其余部分保持蓝本原样。 */
+function normalizeUsage(d) {
+  const w = d.window || {};
+  const total = Number(w.prompt_tokens || 0) + Number(w.completion_tokens || 0);
+  const byKey = (m) => Object.entries(m || {}).map(([key, b]) => ({
+    key,
+    requests: (b && b.requests) || 0, errors: (b && b.fail) || 0,
+    prompt_tokens: (b && b.prompt_tokens) || 0, completion_tokens: (b && b.completion_tokens) || 0,
+    total_tokens: ((b && b.prompt_tokens) || 0) + ((b && b.completion_tokens) || 0),
+    points: (b && b.points) || 0, avg_latency_ms: (b && b.avg_latency_ms) || 0,
+  }));
+  return {
+    totals: {
+      requests: w.total || 0, errors: w.fail || 0,
+      prompt_tokens: w.prompt_tokens || 0, completion_tokens: w.completion_tokens || 0,
+      reasoning_tokens: w.reasoning_tokens || 0,
+      total_tokens: total, points: w.points || 0,
+      avg_latency_ms: w.avg_latency_ms || 0,
+    },
+    by_account: byKey(w.by_account),
+    by_model: byKey(w.by_model),
+    hourly: d.hourly || [],
+    from: w.from, to: w.to,
+  };
+}
+
+function renderUsage(d) {
+  usageData = d || {};
+  const t = usageData.totals || {};
+  const total = Number(t.total_tokens || 0);
+  const pt = Number(t.prompt_tokens || 0);
+  const ct = Number(t.completion_tokens || 0);
+  const reqs = Number(t.requests || 0);
+  const errs = Number(t.errors || 0);
+  const okRate = reqs ? (reqs - errs) / reqs * 100 : null;
+  // 构成条要的是合法 CSS 宽度，usPct 在无样本时返回 "—"，不能直接拼进 style。
+  const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
+  // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）。
+  $('usStats').innerHTML =
+    usKpi(fmtTok(reqs), '请求数', 'c-accent',
+      errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
+    usKpi(fmtTok(total), '总 token', 'c-accent',
+      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
+      '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+    usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
+    usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
+    usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
+      okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
+    usKpi(fmtPoints(t.points), '消耗积分', 'c-warn', t.reasoning_tokens ? '思考 ' + fmtTok(t.reasoning_tokens) + ' tok' : '上游观测计量') +
+    usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft');
+
+  const winLabel = trangeLabel('usRange');
+  const rangeEcho = usageData.from
+    ? new Date(usageData.from * 1000).toLocaleString('zh-CN', { hour12: false }).slice(0, 16) +
+      ' → ' + (usageData.to ? new Date(usageData.to * 1000).toLocaleString('zh-CN', { hour12: false }).slice(0, 16) : '现在')
+    : '';
+  const note = ((rangeEcho || winLabel) + ' · ' + (usageData.hourly || []).length + ' 个分桶');
+  $('usNote').textContent = note;
+  $('usNote').title = note; // 窄屏单行截断时靠悬停看全
+
+  renderUsageDim();
+  renderCreditDim();
+  renderHourlyTable(usageData.hourly || []);
+  renderUsageChart(usageData.hourly || []);
+}
+
+// renderHourlyTable 积分与 token 按小时（蓝本 usHourBody 表位的 Loomy 实现）。
+function renderHourlyTable(hourly) {
+  const rows = (hourly || []).filter(h => (h.requests || 0) > 0 || (h.tokens || 0) > 0);
+  const tb = $('usHourBody');
+  tb.innerHTML = rows.length ? rows.map(h => {
+    const tok = Number(h.tokens || 0);
+    return '<tr>' +
+      '<td class="num">' + esc(h.hour || '') + '</td>' +
+      '<td class="num">' + fmtTok(h.requests || 0) + '</td>' +
+      '<td class="num">' + fmtTok(h.prompt_tokens || 0) + '</td>' +
+      '<td class="num">' + fmtTok(h.completion_tokens || 0) + '</td>' +
+      '<td class="num">' + fmtTok(tok) + usMixBar(h.prompt_tokens, h.completion_tokens, tok) + '</td>' +
+      '<td class="num">' + fmtPoints(h.points) + '</td>' +
+      '</tr>';
+  }).join('') : '<tr><td colspan="6" class="empty">该窗口暂无用量</td></tr>';
+}
+
+/* ── 用量明细：维度页签共用一张表 ──────────────────────────────────── */
+const US_DIMS = {
+  account: { key: 'by_account', title: '账号', withPerf: true, span: 9 },
+  model: { key: 'by_model', title: '模型', withPerf: false, span: 8 },
+};
+function usSortRows(rows, sort) {
+  const out = rows.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  const val = a => sort === 'requests' ? num(a.requests)
+    : sort === 'errors' ? num(a.errors)
+    : sort === 'latency' ? num(a.avg_latency_ms)
+    : sort === 'points' ? num(a.points)
+    : num(a.total_tokens);
+  out.sort((a, b) => val(b) - val(a));
+  return out;
+}
+function usDimHead(dim) {
+  const m = US_DIMS[dim] || US_DIMS.account;
+  return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
+    '<th class="num">请求</th><th class="num">失败</th>' +
+    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th><th class="num">积分</th>' +
+    (m.withPerf ? '<th class="num">均延迟</th>' : '') +
+    '</tr>';
+}
+/* usTabsHtml 维度切换按钮（带条数徽标）。整段 innerHTML 重写而不是逐个改 class：
+   容器的 click 监听是委托式的，换掉子节点不会丢事件，代码也更短。 */
+function usTabsHtml(dims, active, counts) {
+  return dims.map(([k, label]) => {
+    const n = counts ? counts[k] : null;
+    return '<button data-dim="' + k + '"' + (k === active ? ' class="on"' : '') + '>' +
+      esc(label) + (n == null ? '' : '<span class="cnt">' + n + '</span>') + '</button>';
+  }).join('');
+}
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型']];
+function renderUsageDim() {
+  const d = usageData || {};
+  const m = US_DIMS[usDim] || US_DIMS.account;
+  const rows = usSortRows(d[m.key] || [], usSort);
+  $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
+    account: (d.by_account || []).length,
+    model: (d.by_model || []).length,
+  });
+  $('usDimHead').innerHTML = usDimHead(usDim);
+  $('usDimBody').innerHTML = rows.map(x =>
+    '<tr><td class="mark" aria-hidden="true"></td>' +
+    '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
+    '<td class="num">' + fmtTok(x.requests) + '</td>' +
+    '<td class="num">' + (x.errors ? '<span style="color:var(--warn)">' + fmtTok(x.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + fmtTok(x.prompt_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(x.completion_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(x.total_tokens) + usMixBar(x.prompt_tokens, x.completion_tokens, x.total_tokens) + '</td>' +
+    '<td class="num">' + fmtPoints(x.points) + '</td>' +
+    (m.withPerf ? '<td class="num">' + fmtMs(x.avg_latency_ms) + '</td>' : '') +
+    '</tr>'
+  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+}
+$('usDimTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usDim = b.dataset.dim;
+  renderUsageDim();
+});
+$('usSort').onchange = () => { usSort = $('usSort').value; renderUsageDim(); };
+
+/* ── 积分扣除维度（按账号/按模型；数据同 usage 响应，Loomy 里 points 即积分）── */
+function renderCreditDim() {
+  const d = usageData || {};
+  const dimKey = usCreditDim === 'model' ? 'by_model' : 'by_account';
+  const rows = (d[dimKey] || []).filter(x => Number(x.points || 0) > 0);
+  const tokSum = rows.reduce((n, x) => n + Number(x.total_tokens || 0), 0);
+  const ptSum = rows.reduce((n, x) => n + Number(x.points || 0), 0);
+  $('usCreditStats').innerHTML =
+    usKpi(fmtPoints(ptSum), '消耗积分', 'c-accent', '台账观测值') +
+    usKpi(fmtTok(tokSum), '匹配 Token', 'c-mute', '与积分同时观测') +
+    usKpi(tokSum ? trimFixed((ptSum / tokSum * 1e6).toFixed(2)) + ' / 1M' : '—', '平均积分 / 1M Token', 'c-ok', '越低越划算') +
+    usKpi(String(rows.length), '有扣费口径', 'c-mute', usCreditDim === 'model' ? '个模型' : '个账号');
+  $('usCreditHead').innerHTML = '<tr><th class="mark" aria-hidden="true"></th><th>' +
+    (usCreditDim === 'model' ? '模型' : '账号') + '</th><th class="num">请求</th><th class="num">扣除积分</th><th class="num">Token</th><th class="num">积分 / 1M Token</th></tr>';
+  $('usCreditBody').innerHTML = rows.map(x =>
+    '<tr><td class="mark" aria-hidden="true"></td>' +
+    '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
+    '<td class="num">' + fmtTok(x.requests) + '</td>' +
+    '<td class="num">' + fmtPoints(x.points) + '</td>' +
+    '<td class="num">' + fmtTok(x.total_tokens) + '</td>' +
+    '<td class="num">' + (x.total_tokens ? trimFixed((x.points / x.total_tokens * 1e6).toFixed(2)) : '—') + '</td>' +
+    '</tr>'
+  ).join('') || '<tr><td colspan="6" class="empty">该窗口内没有积分消耗记录</td></tr>';
+  $('usCreditTabs').innerHTML = usTabsHtml(US_DIM_TABS, usCreditDim, {
+    account: (d.by_account || []).filter(x => Number(x.points || 0) > 0).length,
+    model: (d.by_model || []).filter(x => Number(x.points || 0) > 0).length,
+  });
+}
+$('usCreditTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usCreditDim = b.dataset.dim;
+  renderCreditDim();
+});
+
+/* 图表点位：后端 hour 桶 {hour:"MM-DD HH:00", requests, prompt_tokens,
+   completion_tokens, tokens, points}。 */
+function parseHourPoint(s) {
+  const text = String(s || '');
+  let m = text.match(/^(\d{2})-(\d{2}) (\d{2}):00$/);
+  const now = new Date();
+  if (m) {
+    // "MM-DD HH:00" → 当年本地时区；跨年窗口按"更早就是明年"修正（30 天窗口够用）。
+    let d = new Date(Number(now.getFullYear()), Number(m[1]) - 1, Number(m[2]), Number(m[3]), 0, 0);
+    if (d.getTime() > now.getTime() + 3600 * 1000) d = new Date(d.getFullYear() - 1, d.getMonth(), d.getDate(), d.getHours());
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+  m = text.match(/^(\d{2})-(\d{2})$/);
+  if (m) {
+    let d = new Date(Number(now.getFullYear()), Number(m[1]) - 1, Number(m[2]), 0, 0, 0);
+    if (d.getTime() > now.getTime() + 86400 * 1000) d = new Date(d.getFullYear() - 1, d.getMonth(), d.getDate());
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+  return null;
+}
+// 跨日窗口用日期标签，纯日内窗口用小时标签。
+function fmtTokTimeLabel(t, minute) {
+  const d = new Date(t);
+  return minute
+    ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+    : String(d.getHours()).padStart(2, '0') + ':00';
+}
+
+function renderUsageChart(hourly) {
+  const host = $('usChart');
+
+  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+  const pts = [];
+  for (const h of hourly) {
+    const t = parseHourPoint(h.hour);
+    if (t == null) continue;
+    const pt = Number(h.prompt_tokens || 0);
+    const ct = Number(h.completion_tokens || 0);
+    const tt = Number(h.tokens || 0) || (pt + ct);
+    pts.push({ t, raw: h.hour, pt, ct, tt, pts: Number(h.points || 0), req: h.requests || 0 });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    $('usChartNote').textContent = '—';
+    return;
+  }
+
+  const W = 1200, H = 200, PL = 58, PR = 14, PT = 18, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB;
+
+  const t0 = pts[0].t;
+  const t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+
+  const max = Math.max(1, ...pts.map(p => p.tt));
+  const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
+  const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
+  $('usChartNote').textContent =
+    pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + peak.raw +
+    ' · 均值 ' + fmtTok(avg);
+
+  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
+  // 变细，但不会细到看不见。
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(2, Math.min(30, slot * 0.7));
+
+  // 首尾各让出半个柱宽：否则第一个点和最后一个点的柱子会各有一半跑到绘图区外。
+  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
+  const yOf = v => PT + ih - ih * (v / max);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
+            'preserveAspectRatio="xMidYMid meet">';
+
+  // 柱体渐变：顶部实、底部略透，堆叠时两段仍能一眼分清（纯色块并排会糊成一片）。
+  // 注意 stop-color 必须走 style 而不是 presentation 属性——Blink/WebKit 不解析
+  // 属性里的 var()，写成 stop-color="var(--accent)" 会整条渐变失效（柱子全透明）。
+  out += '<defs>' +
+    '<linearGradient id="usGradP" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--accent);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--accent);stop-opacity:.6"/></linearGradient>' +
+    '<linearGradient id="usGradC" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--ok);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--ok);stop-opacity:.6"/></linearGradient>' +
+    '</defs>';
+
+  // y 轴网格 + 刻度
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+  }
+
+  // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
+  if (avg > 0 && avg < max) {
+    const y = yOf(avg);
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk-avg" x="' + (PL + 5) + '" y="' + (y - 4).toFixed(1) +
+           '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
+  }
+
+  // 柱子。每根一个 <g>，<title> 作为它的**子元素**：
+  //   - <title> 只有作为元素的子节点才是那个元素的悬停提示；挂在 <svg> 根下时浏览器
+  //     把它当整图的说明，于是**所有柱子都显示最后一条数据**（蓝本 issue #128）。
+  //   - 两个 rect（prompt/completion 堆叠）共用一个 <title>，悬停任一段都是同一份明细。
+  // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:3px}，而 SVG2 里
+  // height 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 3px 高（踩过）。
+  const yBase = PT + ih;
+  for (const p of pts) {
+    const x = xOf(p.t) - bw / 2;
+    const hTot = ih * (p.tt / max);
+    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
+    out += '<g><title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次 / ' + fmtPoints(p.pts) + ' 积分</title>';
+    if (hP > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
+      '" fill="url(#usGradP)"' + (hC > 0 ? '' : ' rx="1.5"') + '/>';
+    if (hC > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
+      '" fill="url(#usGradC)" rx="1.5"/>';
+    out += '</g>';
+  }
+
+  // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
+  {
+    const px = xOf(peak.t);
+    const py = yOf(peak.tt);
+    const anchor = px > W - PR - 90 ? 'end' : 'middle';
+    out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) +
+           '" y="' + Math.max(10, py - 5).toFixed(1) + '" text-anchor="' + anchor + '">' +
+           '峰值 ' + fmtTok(peak.tt) + '</text>';
+  }
+
+  // x 轴基线画在柱子之后，避免压在柱底
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
+         '" y2="' + yBase + '"/>';
+
+  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  const multiDay = new Set(pts.map(p => new Date(p.t).getDate())).size > 1;
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - target);
+      if (d < best) { best = d; bi = i; }
+    }
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi];
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' +
+           esc(fmtTokTimeLabel(p.t, multiDay)) + '</text>';
+  }
+
+  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
+  let prevDay = null;
+  for (const p of pts) {
+    const d = new Date(p.t).getDate();
+    if (prevDay !== null && d !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.45"/>';
+    }
+    prevDay = d;
+  }
+
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+$('btnUsage').onclick = loadUsage;
+// 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
+trangeBind('usRange', loadUsage);
+
+async function loadUsage() {
+  const q = trangeQuery('usRange', true);
+  try {
+    const d = await api('usage?' + q.toString());
+    renderUsage(normalizeUsage(d));
+  } catch (e) {
+    // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
+    usageData = null;
+    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    $('usChartNote').textContent = '—';
+    $('usStats').innerHTML = '';
+    $('usCreditStats').innerHTML = '';
+    $('usNote').textContent = '—';
+    $('usDimNote').textContent = '—';
+    $('usDimHead').innerHTML = '';
+    $('usCreditHead').innerHTML = '';
+    $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
+    $('usCreditTabs').innerHTML = usTabsHtml(US_DIM_TABS, usCreditDim, null);
+    $('usDimBody').innerHTML = '<tr><td colspan="9" class="empty">读取用量失败</td></tr>';
+    $('usCreditBody').innerHTML = '<tr><td colspan="6" class="empty">读取用量失败</td></tr>';
+    $('usHourBody').innerHTML = '<tr><td colspan="6" class="empty">读取用量失败</td></tr>';
+  }
+}
+
+/* ── 积分构成 ─────────────────────────────────────────────────────── */
+/* Loomy 口径（抓包核对）：余额 = 每日赠送（登录后刷新 5000，次日周期到期）+
+   长期积分（注册奖励/邀请，不到期）；扣费先活动/兑换码、后长期（上游执行）。
+   后端 packages 已把额度折算成「包」，这里吃蓝本的包渲染。 */
+const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
+                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
+                           '#e2607a', '#20a4a4', '#8fbf3f', '#d4785c',
+                           '#7c83db', '#c48a2f', '#b45f8c', '#5aa9e6'];
+function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
+const PK_DAY_MS = 24 * 3600 * 1000;
+
+// pkAccountColorMap 按 UID 稳定分配颜色：排序后分配，账号刷新/重排不会换色。
+function pkAccountColorMap(list) {
+  const uids = (list || [])
+    .filter(a => a && !a.error && a.uid)
+    .map(a => String(a.uid))
+    .sort();
+  const colors = new Map();
+  uids.forEach((uid, i) => colors.set(uid, PK_ACCOUNT_COLORS[i % PK_ACCOUNT_COLORS.length]));
+  return colors;
+}
+
+// pkExpiryMs 包到期毫秒时间戳（Loomy 每日包的 end_time 是 "YYYY-MM-DD"，
+// 无时区后缀 → 按 +08:00 解析，与上游运营口径一致）。
+function pkExpiryMs(p) {
+  const text = String((p && p.end_time) || '').trim();
+  if (!text) return null;
+  let iso = text.includes('T') ? text : text.replace(' ', 'T');
+  if (!/(?:Z|[+-]\d\d:?\d\d)$/.test(iso)) iso += '+08:00';
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function pkExpiryText(expiresAt) {
+  if (!expiresAt) return '无到期时间';
+  const diff = expiresAt - Date.now();
+  if (diff <= 0) return '已到期';
+  const minutes = Math.max(1, Math.ceil(diff / 60000));
+  if (minutes < 60) return '剩余 ' + minutes + ' 分钟';
+  const hours = Math.ceil(diff / 3600000);
+  if (hours < 24) return '剩余 ' + hours + ' 小时';
+  return '剩余 ' + Math.ceil(diff / PK_DAY_MS) + ' 天';
+}
+function pkCreditOpacity(days) {
+  if (days == null || !Number.isFinite(Number(days))) return 1;
+  return 0.25 + 0.75 * Math.max(0, Math.min(29, Number(days) - 1)) / 29;
+}
+
+/* pkBySource 把包按名称归并：「来源 → 面额/剩余/个数」。 */
+function pkBySource(packs) {
+  const m = new Map();
+  for (const p of packs) {
+    const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    const e = m.get(k) || {
+      key: k, name: p.name || '(未命名)', code: p.package_code || '',
+      n: 0, remain: 0, size: 0, used: 0, minEnd: '', minCreated: '',
+    };
+    e.n += 1;
+    e.remain += Number(p.remain || 0);
+    e.size += Number(p.size || 0);
+    e.used += Number(p.used || 0);
+    const t = String(p.end_time || '').slice(0, 10);
+    if (t && (!e.minEnd || t < e.minEnd)) e.minEnd = t;
+    const c = String(p.created_at || '').slice(0, 10);
+    if (c && (!e.minCreated || c < e.minCreated)) e.minCreated = c;
+    m.set(k, e);
+  }
+  return [...m.values()].sort((a, b) => b.size - a.size);
+}
+
+function pkAccountSegments(a, now) {
+  let balance = Math.max(0, Number(a.remain || 0));
+  const out = [];
+  for (const p of a.packages || []) {
+    const remain = Number(p.remain || 0);
+    if (!Number.isFinite(remain) || remain <= 0 || balance <= 0) continue;
+    const amount = Math.min(balance, remain);
+    const expiresAt = pkExpiryMs(p);
+    out.push({
+      amount, expiresAt, uid: String(a.uid || ''),
+      days: expiresAt == null ? null : Math.max(0, Math.ceil((expiresAt - now) / PK_DAY_MS)),
+      source: p.name || '积分',
+      accountName: a.nickname || String(a.uid || '') || '未命名账号',
+    });
+    balance -= amount;
+  }
+  return out.sort((x, y) => {
+    if (x.expiresAt == null && y.expiresAt != null) return 1;
+    if (x.expiresAt != null && y.expiresAt == null) return -1;
+    return (x.expiresAt || 0) - (y.expiresAt || 0);
+  });
+}
+
+function summarizeCreditDays(list, now) {
+  const buckets = new Map();
+  let unavailable = 0;
+  for (const a of list || []) {
+    if (a.error || !Number.isFinite(Number(a.remain))) { unavailable++; continue; }
+    for (const segment of pkAccountSegments(a, now)) {
+      if (segment.days == null) continue;
+      let row = buckets.get(segment.days);
+      if (!row) { row = { days: segment.days, credits: 0, segments: [] }; buckets.set(segment.days, row); }
+      row.credits += segment.amount;
+      row.segments.push(segment);
+    }
+  }
+  const rows = [...buckets.values()].sort((a, b) => a.days - b.days);
+  return { rows, accountCount: (list || []).length, unavailable };
+}
+
+function renderExpiryDistribution(list, now) {
+  const summary = summarizeCreditDays(list, now);
+  const colors = pkAccountColorMap(list);
+  const rows = summary.rows.map(row => {
+    const total = row.credits || 1;
+    const nodes = row.segments.map(segment => {
+      const color = colors.get(segment.uid) || 'var(--accent)';
+      const title = segment.source + '\n' + fmtTok(segment.amount) + ' 积分\n' +
+        (segment.expiresAt ? '到期 ' + new Date(segment.expiresAt).toLocaleString('zh-CN', { hour12: false }) + '（' + pkExpiryText(segment.expiresAt) + '）' : '不到期') + '\n' +
+        segment.accountName;
+      return '<span class="pk-expiry-seg" style="--seg-color:' + color +
+        ';opacity:' + pkCreditOpacity(segment.days).toFixed(5) +
+        ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
+        ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
+    }).join('');
+    return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '今天到期' : row.days + ' 天') +
+      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
+      '</b></div>';
+  }).join('');
+  const foot = summary.accountCount + ' 个账号' +
+    (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
+  const legend = (list || []).filter(a =>
+    a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
+  ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
+    '"></i>' + esc(a.nickname || String(a.uid)) + '</span>').join('');
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
+  $('pkExpiry').innerHTML = (rows
+    ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
+    : '<div class="pk-expiry-empty">暂无将到期积分（每日赠送次日到期；长期积分不到期、不入图）</div>') +
+    (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
+    '<div class="pk-expiry-foot">' + esc(foot) + '</div>';
+}
+
+function pkDetailCompare(a, b) {
+  const sizeOf = p => { const n = Number(p && p.size); return Number.isFinite(n) ? n : 0; };
+  const ea = pkExpiryMs(a), eb = pkExpiryMs(b);
+  if (ea == null && eb != null) return 1;
+  if (ea != null && eb == null) return -1;
+  if (ea != null && eb != null && ea !== eb) return ea - eb;
+  return sizeOf(b) - sizeOf(a);
+}
+function pkDetailGroups(packs) {
+  const active = [], used = [];
+  let usedSize = 0;
+  for (const p of packs || []) {
+    const remain = Number(p && p.remain);
+    if (remain > 0) { active.push(p); continue; }
+    used.push(p);
+    const size = Number(p && p.size);
+    if (Number.isFinite(size)) usedSize += size;
+  }
+  active.sort(pkDetailCompare);
+  used.sort(pkDetailCompare);
+  return { active, used, usedSize };
+}
+
+function renderPackages(d) {
+  const list = (d.accounts || []);
+  const now = Date.now();
+  renderExpiryDistribution(list, now);
+  if (!list.length) {
+    $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
+    $('pkDetail').innerHTML = '';
+    return;
+  }
+  const names = [];
+  for (const a of list) for (const s of pkBySource(a.packages || [])) {
+    if (!names.includes(s.key)) names.push(s.key);
+  }
+  names.sort((x, y) => {
+    const sz = n => Math.max(...list.map(a => {
+      const f = pkBySource(a.packages || []).find(s => s.key === n);
+      return f ? f.size : 0;
+    }));
+    return sz(y) - sz(x);
+  });
+  const colorOf = n => pkColor(names.indexOf(n));
+  const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
+
+  $('pkSummary').innerHTML = list.map(a => {
+    if (a.error) {
+      return '<div class="pk-card"><div class="who"><span class="nm">' + esc(a.nickname || a.uid) + '</span></div>' +
+        '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
+    }
+    const srcs = pkBySource(a.packages || []);
+    const total = Math.max(1, Number(a.size || 0));
+    const bar = srcs.map(s =>
+      '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' + colorOf(s.key) +
+      '" title="' + esc(s.name) + ' ' + fmtPoints(s.size) + '"></i>').join('');
+    const legend = srcs.map(s =>
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' + esc(s.name) + ' ×' + s.n +
+      ' · ' + fmtPoints(s.size) + (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>').join('');
+    const inv = (a.invitation_codes || []).map(c =>
+      '<span class="tag mute" title="邀请码 ' + esc(c.inviteCode || '') + ' 已用 ' + (c.usedCount || 0) + '/' + (c.maxUses || 0) + '">' +
+      esc(c.inviteCode || '') + '</span>').join(' ');
+    return '<div class="pk-card">' +
+      '<div class="who"><span class="nm">' + remarkName(a.uid, esc(a.nickname || a.uid)) + '</span>' +
+      (a.daily_cycle_date ? '<span class="realm">' + esc(a.daily_cycle_date) + (a.checkin_done ? ' · 已签到' : ' · 未签到') + '</span>' : '') + '</div>' +
+      '<div class="big">' + fmtPoints(a.remain) + '</div>' +
+      '<div class="sub">共 ' + fmtPoints(a.size) + ' · ' + (a.packages || []).length + ' 个口径 · 占最高 ' +
+      (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
+      '<div class="mixbar">' + bar + '</div>' +
+      '<div class="pk-legend">' + legend + '</div>' +
+      (inv ? '<div class="pk-legend">' + inv + '</div>' : '') +
+      '</div>';
+  }).join('');
+
+  $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
+
+  $('pkDetail').innerHTML = list.map(a => {
+    if (a.error) return '';
+    const groups = pkDetailGroups(a.packages || []);
+    const rowOf = p => {
+      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+      return '<tr><td class="mark" aria-hidden="true"><i style="background:' + colorOf(k) + '"></i></td>' +
+        '<td>' + esc(p.name || '(未命名)') + '<div class="note">' + esc(p.package_code || '') + '</div></td>' +
+        '<td class="num">' + fmtPoints(p.size) + '</td>' +
+        '<td class="num">' + fmtPoints(p.remain) + '</td>' +
+        '<td class="num">' + fmtPoints(p.used) + '</td>' +
+        '<td class="num">' + esc(String(p.created_at || '').slice(0, 16) || '—') + '</td>' +
+        '<td class="num">' + esc(String(p.end_time || '').slice(0, 10) || '不到期') + '</td></tr>';
+    };
+    const usedNote = groups.used.length
+      ? '<tr class="pk-group-summary"><td colspan="7">已入账来源 ' + groups.used.length + ' 项（面额合计 ' + fmtPoints(groups.usedSize) + '，余额已并入上方口径，不重复计数）</td></tr>' +
+        groups.used.map(rowOf).join('')
+      : '';
+    return '<div class="box"><header><h3>' + remarkName(a.uid, esc(a.nickname || a.uid)) + '</h3><span class="grow"></span>' +
+      '<span class="note">可用 ' + fmtPoints(a.remain) + ' / 历史总额 ' + fmtPoints(a.size) +
+      ' · 每日 ' + esc(a.daily_cycle_date || '—') + '</span></header>' +
+      '<div class="tbl-wrap"><table class="acc"><thead><tr>' +
+      '<th class="mark" aria-hidden="true"></th><th>口径 / 来源</th>' +
+      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
+      '<th class="num">发放</th><th class="num">到期</th>' +
+      '</tr></thead><tbody>' + groups.active.map(rowOf).join('') + usedNote + '</tbody></table></div></div>';
+  }).join('');
+}
+
+// 按需拉取（蓝本 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
+// 账号一多既慢又压上游。有缓存先直接渲染（标注数据年龄），只有首次进入或显式刷新生效。
+let lastPackages = null, lastPackagesAt = 0;
+function invalidatePackages() { lastPackages = null; lastPackagesAt = 0; }
+
+async function loadPackages(force) {
+  if (!force && lastPackages) {
+    renderPackages(lastPackages);
+    const ageMin = Math.floor((Date.now() - lastPackagesAt) / 60000);
+    if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
+    return;
+  }
+  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  $('pkDetail').innerHTML = '';
+  $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
+  try {
+    const d = await api('packages');
+    lastPackages = d;
+    lastPackagesAt = Date.now();
+    renderPackages(d);
+  } catch (e) {
+    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+// 「刷新」始终实时查：必须显式 force —— 直接 `onclick = loadPackages` 会把事件对象
+// 当真值传进去，恒等于强刷。
+$('btnPk').onclick = () => loadPackages(true);
+
+/* ══ 账号备注（只写本机 localStorage；账号池 / 用量 / 积分构成视图共用同一份映射）══
+   展示层只替换文本并挂 .rm-ghost 虚体，账号标识本身仍由服务端下发，不写回后端；
+   备注是纯展示层信息，不参与选号 / 计费 / 鉴权。 */
+function remarksAll() {
+  if (remarksCache) return remarksCache;
+  try { remarksCache = JSON.parse(localStorage.getItem(LS_REMARKS)) || {}; }
+  catch (e) { remarksCache = {}; }
+  return remarksCache;
+}
+function remarkOf(key) {
+  key = String(key == null ? '' : key);
+  return key ? String(remarksAll()[key] || '') : '';
+}
+/* nameHtml 必须是已转义的 HTML；有备注时返回「备注 + 原标识（浅色虚体）」 */
+function remarkName(key, nameHtml) {
+  const r = remarkOf(key);
+  return r ? esc(r) + '<span class="rm-ghost">' + nameHtml + '</span>' : nameHtml;
+}
+function storeRemarks(map) {
+  remarksCache = map;
+  try { localStorage.setItem(LS_REMARKS, JSON.stringify(map)); } catch (e) {}
+}
+function remarkFormRows() {
+  const rows = ((overviewData && overviewData.accounts) || [])
+    .map(s => ({ uid: String(s.name || ''), who: s.name || '未命名' }))
+    .filter(r => r.uid);
+  for (const k of Object.keys(remarksAll())) {
+    if (!rows.some(r => r.uid === k)) rows.push({ uid: k, who: k });
+  }
+  return rows;
+}
+function renderRemarkBody() {
+  const box = $('remarkBody');
+  const rows = remarkFormRows();
+  box.innerHTML = rows.length
+    ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
+        '<input type="text" data-uid="' + esc(r.uid) + '" value="' + esc(remarksAll()[r.uid] || '') + '" placeholder="备注（留空即清除）" maxlength="24"></div>').join('')
+    : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
+}
+function openRemarks() {
+  renderRemarkBody();
+  $('remarkVeil').classList.add('on');
+}
+function closeRemarks() { $('remarkVeil').classList.remove('on'); }
+function saveRemarkForm() {
+  const map = {};
+  document.querySelectorAll('#remarkBody input[data-uid]').forEach(inp => {
+    const v = inp.value.trim();
+    if (v) map[inp.getAttribute('data-uid')] = v;
+  });
+  storeRemarks(map);
+  closeRemarks();
+  // 备注只影响本机展示：重渲染当前视图即可，无需后端参与。
+  if (view === 'accounts') loadOverview(true);
+  else if (view === 'usage' && usageData) renderUsage(usageData);
+  toast('备注已保存（仅本机浏览器）');
+}
+$('btnRemarks').onclick = openRemarks;
+$('btnRemarkClose').onclick = closeRemarks;
+$('btnRemarkClear').onclick = () => { storeRemarks({}); renderRemarkBody(); };
+$('btnRemarkSave').onclick = saveRemarkForm;

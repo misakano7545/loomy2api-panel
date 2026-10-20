@@ -178,13 +178,18 @@ func refreshQuotas(p *pool.Pool, up *upstream.Client) {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			balance, daily, available, err := up.Quota(ctx, a.Session)
+			q, err := up.Quota(ctx, a.Session)
 			if err != nil {
 				return
 			}
 			before := a.AvailablePoints()
-			a.SetQuota(balance, daily, available)
+			prevCycle := a.DailyCycleDate
+			a.SetQuota(q)
 			after := a.AvailablePoints()
+			// Quota 内部已调幂等 first-login：跨日自动刷新每日积分。
+			if q.CycleDate != "" && prevCycle != "" && q.CycleDate != prevCycle {
+				log.Printf("账号 %s 进入新每日周期 %s（每日 %d，已自动签到刷新）", a.Name, q.CycleDate, derefI64(q.DailyQuota))
+			}
 			// 余额从耗尽恢复 → 自动解冻硬冷却。
 			if before != nil && after != nil && *before <= 0 && *after > 0 {
 				a.ResetCooldowns()
@@ -213,6 +218,14 @@ func normalizeAddr(addr string) string {
 		return "127.0.0.1" + addr
 	}
 	return addr
+}
+
+// derefI64 安全解引用 *int64（nil → 0），仅用于日志。
+func derefI64(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func maxInt(a, b int) int {

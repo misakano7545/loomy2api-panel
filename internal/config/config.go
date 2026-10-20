@@ -59,6 +59,15 @@ type Model struct {
 	MaxOutput      int      `json:"max_output_tokens,omitempty"`
 	Capabilities   []string `json:"capabilities,omitempty"`
 	ReasoningTiers []string `json:"reasoning_efforts,omitempty"`
+	// 以下字段来自真实 /models 响应（2026-10-21 抓包核对）：
+	//   - 上游**没有** multiplier 字段，倍率与「限时免费」都写在 name 里，
+	//     形如 "Spark-X2.6-preview(限时免费)(x0.0)" / "DeepSeek V4.1 Flash(x2.0)"；
+	//   - type=chat|image，protocol=openai_chat，默认档 default_reasoning_effort。
+	IsFree           bool   `json:"is_free,omitempty"`  // 限时免费（倍率 0 或名称标注）
+	Type             string `json:"type,omitempty"`     // chat | image
+	Protocol         string `json:"protocol,omitempty"` // openai_chat | …
+	IsDefault        bool   `json:"is_default_model,omitempty"`
+	DefaultReasoning string `json:"default_reasoning_effort,omitempty"`
 }
 
 // Config 全量配置。字段名即 config.json 的键名（独立结构体便于面板表单绑定）。

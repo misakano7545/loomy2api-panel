@@ -148,22 +148,135 @@ body: { model, messages, temperature, max_tokens, stream,
   `points_consumed`（本次扣的积分）、`prompt_tokens_details.cached_tokens`。
 - 流式：标准 OpenAI SSE（`data: {...}`），末尾 `data: [DONE]`。
 
+### 5.2.1 模型目录（`GET /models`，2026-10-21 抓包核对）
+
+真实响应结构（13 个模型实测）：
+
+```json
+{"reasoning_enabled": true, "object": "list", "data": [{
+  "id": "DeepSeek-V4.1-Flash",
+  "name": "DeepSeek V4.1 Flash(x2.0)",
+  "type": "chat", "protocol": "openai_chat",
+  "context_length": 1048576, "max_output_tokens": 384000,
+  "is_default_model": true, "default_reasoning_effort": "low",
+  "reasoning_efforts": ["none","low","medium","high","xhigh"],
+  "capabilities": {"reasoning": true, "vision": true, "function_calling": true,
+                   "streaming": true, "system_message": true,
+                   "input_modalities": ["text","image"], "output_modalities": ["text"]}
+}]}
+```
+
+两个必须注意的口径：
+
+1. **没有 `multiplier` 字段**。倍率写在 `name` 的括号里：`(x2.0)`、`（x4.0）`
+   全角括号也出现过。网关用 `[（(]\s*[xX×]\s*([0-9.]+)\s*[）)]` 解析，缺失则留空。
+2. **「限时免费」同样只在 `name` 里**：`Spark-X2.6-preview(限时免费)(x0.0)`。
+   判定条件是「名称含 限时免费/限免」或「解析出的倍率为 0」。网关据此置
+   `is_free`，面板在倍率列渲染「限免」标签、统计限免数，并对 `/v1/models`
+   额外输出 `is_free` / `multiplier: 0`（OpenAI 兼容客户端可忽略）。
+3. `capabilities` 是**对象**（布尔键 + `input_modalities` 数组），不是数组；
+   `type=chat|image` 决定是否图像模型；`auto` 是路由型模型，无倍率。
+
 ### 5.3 额度与积分
 
 ```
-availableBalance = balance（永久）+ dailyBalance（每日免费额度，先扣后补，每日重置）
+availableBalance = balance（长期积分）+ dailyBalance（每日赠送剩余）
 ```
 
 模型有倍率（`x0.1` … `x12.0`），决定一次请求扣多少积分；`spark-x` 在 `x0.1` 最便宜。
 
+#### 5.3.1 真实响应结构（2026-10-21 抓包核对）
+
+两个端点的职责不同，**必须都打**：
+
 ```
 GET  {base}/points/records?record_type=all&pageNo=1&pageSize=100
-POST {base}/points/first-login
+POST {base}/points/first-login          # body: {}
 ```
 
-**坑：上游只认 camelCase 的 `pageSize`**。传 `page_size` 会被静默忽略并回落默认 20 条，
+`points/records` 只回三个余额字段：
+
+```json
+{
+  "code": "000000", "desc": "成功", "trace_id": "…",
+  "data": {
+    "balance": 5000, "dailyBalance": 5000, "availableBalance": 10000,
+    "pageNo": 1, "pageSize": 1, "total": 1,
+    "list": [{
+      "ledgerId": "pl_b55bd6d28242485f8382e9bcbd52934e",
+      "modelName": "", "direction": "credit", "description": "注册奖励",
+      "createdAt": 1792389369, "pointsActual": 5000, "consumeSource": "",
+      "balanceBefore": 5000, "balanceAfter": 10000, "dailyCycleDate": "2026-10-19"
+    }]
+  }
+}
+```
+
+`dailyQuota` / `dailyConsumed` / `permanentBalance` **只有 `first-login` 才返回**：
+
+```json
+{
+  "code": "000000", "desc": "成功",
+  "data": {
+    "alreadyProcessed": true,
+    "currentBalance": 10000, "permanentBalance": 5000, "dailyBalance": 5000,
+    "dailyQuota": 5000, "dailyConsumed": 0, "dailyCycleDate": "2026-10-21",
+    "registerReward": 0, "inviteeReward": 0, "inviterReward": 0,
+    "invitationCodes": [{"inviteCode": "FWF6D5", "usedCount": 0, "maxUses": 1000, "status": "active"}]
+  }
+}
+```
+
+> `dailyCycleDate` 与 `list[].dailyCycleDate` 是两个不同的日期：
+> 前者是当前每日额度所属日（今日），后者是该笔流水发生时所属日。
+
+#### 5.3.2 额度口径（上游明确）
+
+- **每日赠送额度登录后刷新为 5000**；客户端每次启动都会调一次 `points/first-login`，
+  该端点是幂等的（当天已领过返回 `alreadyProcessed: true`，不再重复加）。
+- **扣费顺序：先扣活动 / 兑换码来源的积分，再扣普通长期积分**（`permanentBalance`）。
+
+因此本项目把额度拆成三块展示，不再做单值折算：
+
+| 字段 | 来源 | 语义 |
+|---|---|---|
+| `balance` | records.balance | 长期积分余额 |
+| `dailyBalance` | records.dailyBalance | 每日赠送剩余 |
+| `availableBalance` | records.availableBalance | 可用总额 |
+| `permanentBalance` | first-login | 长期积分（口径同上，交叉校验） |
+| `dailyQuota` | first-login | 每日赠送上限（5000） |
+| `dailyConsumed` | first-login | 当日已消耗 |
+| `dailyCycleDate` | first-login | 每日额度所属日 |
+
+实现见 `internal/upstream.Quota`；单测 `TestQuotaDailyFromFirstLogin`
+用真实响应样本守着「records 拿不到每日额度、必须走 first-login」这条事实。
+
+**签到（领取每日积分）的网关侧适配**：Loomy 没有独立"签到"按钮端点——
+官方客户端每次启动都会调一次 `POST points/first-login` 来刷新每日赠送额度，
+这就是 WorkBuddy 式"模拟登录/签到/领积分"动作在本协议里的等价实现。
+网关把它封装为 `upstream.Checkin`（解析 `alreadyProcessed` / 各额度字段 /
+`invitationCodes`，并直接产出 `Quota` 快照），面板提供：
+
+| 端点 | 行为 |
+|---|---|
+| `POST /panel/api/accounts/{name}/checkin` | 单号签到（幂等，已领过返回 already_processed=true） |
+| `POST /panel/api/checkin_all` | 全池签到（跳过禁用与登录态失效账号） |
+| 登录成功（login / login_all / 新增带密码账号） | 自动链式签到 + 刷额度 |
+| 定时额度刷新（quota_refresh_minutes） | Quota 内部顺带调 first-login，跨日自动续领 |
+
+单测 `TestCheckinParsesRealSample` / `TestCheckinAccount` / `TestCheckinAll`
+用抓包样本守着这条链路。
+
+#### 5.3.3 两个已踩过的坑
+
+**坑一：上游只认 camelCase 的 `pageSize`**。传 `page_size` 会被静默忽略并回落默认 20 条，
 不会报错——排查起来极其费时。本项目在 `internal/upstream` 用常量固定了拼写，
 并有单测 `TestQuotaCamelCasePageSize` 守着。
+
+**坑二：成功码是 `"000000"` 而不是 `"0"`**。上游 `HTTP 200` 的 body 里
+`code: "000000"` 表示成功，`desc: "成功"`。早期的错误信封判定只认 `"0"` / `"200"`，
+把每一个成功的积分响应都改判成 502，导致额度刷新永久失败——而 `points/records`
+本身是好的，问题出在本地判定。单测 `TestErrEnvelopeSuccessCodes` 覆盖了各成功码形态。
 
 ### 5.4 长任务与非流式的 504
 

@@ -285,10 +285,10 @@ func (p *Pool) Acquire(exclude []string, model string, sessionKey string) (*Acco
 		candidates = append(candidates, a)
 	}
 	if len(candidates) == 0 {
-		// 全冷却时从「非禁用、非额度耗尽」的软冷却/熔断账号里选最早到期者顶班。
+		// 全冷却时从「非禁用、非暂停、非额度耗尽」的软冷却/熔断账号里选最早到期者顶班。
 		fallback := make([]*Account, 0)
 		for _, a := range all {
-			if skip[a.Name] || !a.Enabled || !a.SessionValid() {
+			if skip[a.Name] || !a.Enabled || a.Paused || !a.SessionValid() {
 				continue
 			}
 			if p.floorBlocked(a, model) {
@@ -465,13 +465,15 @@ func (p *Pool) pickRoundRobin(cands []*Account) *Account {
 // Overview 汇总统计。
 func (p *Pool) Overview() map[string]any {
 	all := p.All()
-	var healthy, cooling, disabled, inflight int
+	var healthy, cooling, disabled, paused, inflight int
 	var totalAvailable int64
 	var availableKnown bool
 	var requests, points, failures int64
 	for _, a := range all {
 		if !a.Enabled {
 			disabled++
+		} else if a.Paused {
+			paused++ // 暂停选号：单独一档（保号任务照常，但不接流量）
 		} else if a.Healthy() {
 			healthy++
 		} else {
@@ -491,6 +493,7 @@ func (p *Pool) Overview() map[string]any {
 		"healthy":     healthy,
 		"cooling":     cooling,
 		"disabled":    disabled,
+		"paused":      paused,
 		"inflight":    inflight,
 		"requests":    requests,
 		"points_used": points,
@@ -519,6 +522,10 @@ func (p *Pool) stateSnapshot() map[string]any {
 			"balance":      a.Balance,
 			"dailyBalance": a.DailyBalance,
 			"available":    a.Available,
+			"permanent":    a.Permanent,
+			"dailyQuota":   a.DailyQuota,
+			"dailyUsed":    a.DailyUsed,
+			"dailyCycle":   a.DailyCycleDate,
 			"quotaAt":      a.QuotaAt,
 		}
 	}
@@ -597,6 +604,12 @@ func (p *Pool) ApplyState() {
 			d := ptrInt64(st["dailyBalance"])
 			av := ptrInt64(st["available"])
 			a.Balance, a.DailyBalance, a.Available = b, d, av
+			a.Permanent = ptrInt64(st["permanent"])
+			a.DailyQuota = ptrInt64(st["dailyQuota"])
+			a.DailyUsed = ptrInt64(st["dailyUsed"])
+			if v, ok := st["dailyCycle"].(string); ok {
+				a.DailyCycleDate = v
+			}
 			a.QuotaAt = int64Of(st["quotaAt"])
 		}
 	}

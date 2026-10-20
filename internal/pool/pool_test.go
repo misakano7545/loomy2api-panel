@@ -581,3 +581,41 @@ func TestClassifySessionBodyOnly(t *testing.T) {
 		t.Errorf("登录已失效应为 FaultSession，实际 %v", got)
 	}
 }
+
+// TestQuotaSurvivesRestart 额度快照必须落盘：面板重启后积分/签到状态不能归零。
+func TestQuotaSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	avail, perm, daily, quota, used := int64(10000), int64(5000), int64(5000), int64(5000), int64(0)
+	a := &Account{
+		Name: "acc1", LoginID: "13800000000", Enabled: true, Session: "s1",
+		ExpireAt:  time.Now().Add(72 * time.Hour).Unix(),
+		Available: &avail, Permanent: &perm, DailyBalance: &daily,
+		DailyQuota: &quota, DailyUsed: &used, DailyCycleDate: "2026-10-21", QuotaAt: 1792390000,
+	}
+	if err := SaveAccount(dir, a); err != nil {
+		t.Fatalf("SaveAccount: %v", err)
+	}
+	loaded, err := LoadAccounts(dir)
+	if err != nil {
+		t.Fatalf("LoadAccounts: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("账号数 %d", len(loaded))
+	}
+	got := loaded[0]
+	if got.Available == nil || *got.Available != 10000 {
+		t.Errorf("available 未恢复: %v", got.Available)
+	}
+	if got.Permanent == nil || *got.Permanent != 5000 {
+		t.Errorf("permanent 未恢复: %v", got.Permanent)
+	}
+	if got.DailyQuota == nil || *got.DailyQuota != 5000 {
+		t.Errorf("daily_quota 未恢复: %v", got.DailyQuota)
+	}
+	if got.DailyCycleDate != "2026-10-21" {
+		t.Errorf("daily_cycle_date 未恢复: %q", got.DailyCycleDate)
+	}
+	if got.QuotaAt != 1792390000 {
+		t.Errorf("quota_updated_at 未恢复: %d", got.QuotaAt)
+	}
+}

@@ -14,11 +14,25 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/misakano7545/loomy2api-panel/internal/account"
 	"github.com/misakano7545/loomy2api-panel/internal/config"
+)
+
+// 真实 /models 响应把「倍率」和「限时免费」都写在展示名里，没有结构化字段：
+//
+//	"Spark-X2.6-preview(限时免费)(x0.0)" → 限免，倍率 0
+//	"DeepSeek V4.1 Flash(x2.0)"          → 倍率 2.0
+//	"MiniMax M3 （x4.0）"                → 全角括号，倍率 4.0
+//
+// 不解析就会让面板倍率列永远是「—」，也看不出哪些模型限免（抓包核对）。
+var (
+	reModelMult = regexp.MustCompile(`[（(]\s*[xX×]\s*([0-9]+(?:\.[0-9]+)?)\s*[）)]`)
+	reModelFree = regexp.MustCompile(`限时免费|限免`)
 )
 
 // Client 上游模型网关客户端。
@@ -149,6 +163,13 @@ const maxBodyBytes = 32 << 20
 
 // errEnvelope 判定「HTTP 200 + 业务错误」响应：顶层有非零 code、且没有正常
 // 响应的数据键（choices/output/object）。错误信封自己也带 data:{}，故不排除 data。
+//
+// 成功码必须按上游真实取值判断：至少有两种形态（抓包核对 2026-10-21）
+//   - 模型网关 /points/*：code = "000000"（"成功"）
+//   - 部分端点：code = 0 / 200 / "success" / "ok"
+//
+// 早期只认 "0" 和 "200"，导致所有 code="000000" 的成功响应被误判成
+// 业务错误、状态码被改判 502，额度刷新与积分查询整条链路永久失败。
 func errEnvelope(raw []byte) bool {
 	var obj map[string]any
 	if json.Unmarshal(raw, &obj) != nil {
@@ -164,7 +185,19 @@ func errEnvelope(raw []byte) bool {
 		return false
 	}
 	s := strings.TrimSpace(fmt.Sprint(code))
-	return s != "" && s != "0" && s != "200"
+	// 去掉前导零后判零，"000000" / "0" / 0 都算成功。
+	trimmed := strings.TrimLeft(s, "0")
+	switch {
+	case trimmed == "": // "0" / "000000"
+		return false
+	case trimmed == "200": // "200"
+		return false
+	case s == "success", s == "ok": // 文本成功码
+		return false
+	case strings.EqualFold(s, "success"), strings.EqualFold(s, "ok"):
+		return false
+	}
+	return true
 }
 
 // GetJSON 便捷：GET 并解析 JSON。
@@ -231,11 +264,25 @@ func (c *Client) Models(ctx context.Context, session string) ([]config.Model, er
 			continue
 		}
 		model := config.Model{
-			ID:            str(m["id"]),
-			Name:          str(m["name"]),
-			Multiplier:    num(m["multiplier"]),
-			ContextLength: int(num(m["context_length"])),
-			MaxOutput:     int(num(m["max_output_tokens"])),
+			ID:               str(m["id"]),
+			Name:             str(m["name"]),
+			Multiplier:       num(m["multiplier"]),
+			ContextLength:    int(num(m["context_length"])),
+			MaxOutput:        int(num(m["max_output_tokens"])),
+			Type:             str(m["type"]),
+			Protocol:         str(m["protocol"]),
+			IsDefault:        boolOf(m["is_default_model"]),
+			DefaultReasoning: str(m["default_reasoning_effort"]),
+		}
+		// 倍率/限免没有结构化字段，只能从展示名解析（见 reModelMult 注释）。
+		if mm := reModelMult.FindStringSubmatch(model.Name); mm != nil {
+			if f, err := strconv.ParseFloat(mm[1], 64); err == nil {
+				model.Multiplier = f
+			}
+			model.IsFree = model.Multiplier == 0
+		}
+		if reModelFree.MatchString(model.Name) {
+			model.IsFree = true
 		}
 		if caps, ok := m["capabilities"].(map[string]any); ok {
 			for k, v := range caps {
@@ -256,40 +303,116 @@ func (c *Client) Models(ctx context.Context, session string) ([]config.Model, er
 	return out, nil
 }
 
+// Quota 额度快照。字段全部来自上游真实响应，不做本地推算：
+//
+//	GET  points/records      → balance / dailyBalance / availableBalance
+//	POST points/first-login  → permanentBalance / dailyQuota / dailyConsumed / dailyCycleDate
+//
+// 为什么必须同时打两个端点：points/records 只回三个余额字段，dailyQuota 与
+// dailyConsumed 只有 first-login 才给。早期版本只读 points/records，导致
+// 「每日赠送额度」与「当日已用」始终为空（面板显示 ——）。
+//
+// 口径（上游明确）：每日赠送额度登录后刷新为 5000；扣费时先扣活动/兑换码
+// 来源的积分，再扣普通长期积分（permanentBalance）。
+type Quota struct {
+	Balance     *int64 // 普通长期积分余额（points/records.balance）
+	Daily       *int64 // 每日赠送剩余（points/records.dailyBalance）
+	Available   *int64 // 可用总额（points/records.availableBalance）
+	Permanent   *int64 // 长期积分（first-login.permanentBalance）
+	DailyQuota  *int64 // 每日赠送上限，通常 5000（first-login.dailyQuota）
+	DailyUsed   *int64 // 当日已消耗（first-login.dailyConsumed）
+	CycleDate   string // 每日额度所属日期，形如 2026-10-21（first-login.dailyCycleDate）
+	RefreshedAt int64  // 快照取得时间（unix 秒）
+}
+
+// available 取可用总额；上游没给 availableBalance 时按 balance+daily 估。
+func (q *Quota) available() *int64 {
+	if q == nil {
+		return nil
+	}
+	if q.Available != nil {
+		return q.Available
+	}
+	if q.Balance == nil && q.Daily == nil {
+		return nil
+	}
+	var sum int64
+	if q.Balance != nil {
+		sum += *q.Balance
+	}
+	if q.Daily != nil {
+		sum += *q.Daily
+	}
+	return &sum
+}
+
+// dailyRemaining 每日赠送剩余：优先用上游 dailyBalance，
+// 否则用 dailyQuota - dailyConsumed 推算（不会小于 0）。
+func (q *Quota) dailyRemaining() *int64 {
+	if q == nil {
+		return nil
+	}
+	if q.Daily != nil {
+		return q.Daily
+	}
+	if q.DailyQuota == nil {
+		return nil
+	}
+	used := int64(0)
+	if q.DailyUsed != nil {
+		used = *q.DailyUsed
+	}
+	left := *q.DailyQuota - used
+	if left < 0 {
+		left = 0
+	}
+	return &left
+}
+
 // Quota 查询积分余额。上游只认 camelCase 的 pageSize（下划线会被静默忽略）。
-func (c *Client) Quota(ctx context.Context, session string) (balance, daily, available *int64, err error) {
+//
+// 两个端点都打：records 给余额，first-login 给每日额度口径。first-login 是
+// 幂等的（已领过回 alreadyProcessed=true），顺带完成「每日登录刷新额度」。
+func (c *Client) Quota(ctx context.Context, session string) (*Quota, error) {
+	q := &Quota{}
 	// 该端点上游只挂 GET，POST 会直接 404（额度刷新曾因此永久失败）。
 	suffix := "points/records?record_type=all&pageNo=1&pageSize=1"
 	obj, status, err := c.GetJSON(ctx, suffix, session)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 	if status != 200 {
-		return nil, nil, nil, fmt.Errorf("/points/records HTTP %d", status)
+		return nil, fmt.Errorf("/points/records HTTP %d", status)
 	}
-	data, _ := obj["data"].(map[string]any)
-	if data == nil {
-		return nil, nil, nil, nil
+	if data, _ := obj["data"].(map[string]any); data != nil {
+		q.Balance = ptrI64(data["balance"])
+		q.Daily = ptrI64(data["dailyBalance"])
+		q.Available = ptrI64(data["availableBalance"])
 	}
-	balance = ptrI64(data["balance"])
-	daily = ptrI64(data["dailyBalance"])
-	available = ptrI64(data["availableBalance"])
-	if available == nil {
-		var sum int64
-		known := false
-		if balance != nil {
-			sum += *balance
-			known = true
+
+	// 每日额度明细。失败不致命：余额已经拿到，面板退化成只显示余额。
+	if fl, err := c.FirstLogin(ctx, session); err == nil {
+		// FirstLogin 返回的是完整信封，字段在 data 里。
+		data := mapOfAny(fl["data"])
+		if data == nil {
+			data = fl
 		}
-		if daily != nil {
-			sum += *daily
-			known = true
+		q.Permanent = ptrI64(data["permanentBalance"])
+		q.DailyQuota = ptrI64(data["dailyQuota"])
+		q.DailyUsed = ptrI64(data["dailyConsumed"])
+		q.CycleDate = str(data["dailyCycleDate"])
+		if q.Balance == nil {
+			q.Balance = ptrI64(data["permanentBalance"])
 		}
-		if known {
-			available = &sum
+		if q.Daily == nil {
+			q.Daily = ptrI64(data["dailyBalance"])
+		}
+		if q.Available == nil {
+			q.Available = ptrI64(data["currentBalance"])
 		}
 	}
-	return balance, daily, available, nil
+	q.RefreshedAt = time.Now().Unix()
+	return q, nil
 }
 
 // Points 查询积分流水汇总（面板额度页）。
@@ -359,18 +482,34 @@ func (c *Client) Points(ctx context.Context, session string, pages int) (map[str
 	if first == nil {
 		first = map[string]any{}
 	}
-	return map[string]any{
-		"balance":        first["balance"],
-		"daily_balance":  first["dailyBalance"],
-		"available":      first["availableBalance"],
-		"daily_quota":    first["dailyQuota"],
-		"daily_consumed": first["dailyConsumed"],
-		"total":          first["totalBalance"],
-		"records":        records,
-		"debits":         debits,
-		"credits":        credits,
-		"pages":          pages,
-	}, nil
+	out := map[string]any{
+		"balance":       first["balance"],
+		"daily_balance": first["dailyBalance"],
+		"available":     first["availableBalance"],
+		"records":       records,
+		"debits":        debits,
+		"credits":       credits,
+		"pages":         pages,
+	}
+	// dailyQuota / dailyConsumed 不在 points/records 响应里，只有 first-login 提供。
+	// 这里只调 first-login（不调 Quota，否则会重复请求一轮 records）。
+	if fl, err := c.FirstLogin(ctx, session); err == nil {
+		data := mapOfAny(fl["data"])
+		if data == nil {
+			data = fl
+		}
+		if v := ptrI64(data["dailyQuota"]); v != nil {
+			out["daily_quota"] = *v
+		}
+		if v := ptrI64(data["dailyConsumed"]); v != nil {
+			out["daily_consumed"] = *v
+		}
+		if v := ptrI64(data["permanentBalance"]); v != nil {
+			out["permanent"] = *v
+		}
+		out["daily_cycle_date"] = str(data["dailyCycleDate"])
+	}
+	return out, nil
 }
 
 // FirstLogin 触发每日首次登录奖励（幂等：已领过返回 alreadyProcessed）。
@@ -383,6 +522,62 @@ func (c *Client) FirstLogin(ctx context.Context, session string) (map[string]any
 		return nil, fmt.Errorf("/points/first-login HTTP %d", status)
 	}
 	return obj, nil
+}
+
+// CheckinResult 一次「签到/领取每日积分」的结构化结果（抓包核对过的字段）。
+type CheckinResult struct {
+	AlreadyProcessed bool             // 本周期已领过（重复调用不会重复给分）
+	CurrentBalance   int64            // 当前可用总额
+	PermanentBalance int64            // 普通长期积分
+	DailyBalance     int64            // 每日赠送剩余
+	DailyQuota       int64            // 每日赠送上限（登录后自动刷新为 5000）
+	DailyConsumed    int64            // 当日已消耗
+	CycleDate        string           // 每日额度所属日期
+	InvitationCodes  []map[string]any // 邀请码列表（inviteCode/usedCount/maxUses/status）
+	Quota            *Quota           // 可直接喂给 pool.Account.SetQuota 的快照
+}
+
+// Checkin 模拟客户端每日登录领积分：打的正是官方客户端每次启动都会调的
+// POST /points/first-login（幂等）。口径（官方说明）：
+//   - 每日赠送积分在每日登录后自动刷新为 5000；
+//   - 消耗顺序：活动/兑换码积分 → 普通长期积分（上游侧执行，网关只镜像展示）。
+func (c *Client) Checkin(ctx context.Context, session string) (*CheckinResult, error) {
+	obj, err := c.FirstLogin(ctx, session)
+	if err != nil {
+		return nil, err
+	}
+	data := mapOfAny(obj["data"])
+	if data == nil {
+		data = obj
+	}
+	res := &CheckinResult{
+		AlreadyProcessed: boolOf(data["alreadyProcessed"]),
+		CurrentBalance:   int64(num(data["currentBalance"])),
+		PermanentBalance: int64(num(data["permanentBalance"])),
+		DailyBalance:     int64(num(data["dailyBalance"])),
+		DailyQuota:       int64(num(data["dailyQuota"])),
+		DailyConsumed:    int64(num(data["dailyConsumed"])),
+		CycleDate:        str(data["dailyCycleDate"]),
+	}
+	if list, ok := data["invitationCodes"].([]any); ok {
+		for _, it := range list {
+			if m, ok := it.(map[string]any); ok {
+				res.InvitationCodes = append(res.InvitationCodes, m)
+			}
+		}
+	}
+	// first-login 自带全部额度口径，直接构造快照（不必再打 records）。
+	res.Quota = &Quota{
+		Balance:     ptrI64(data["permanentBalance"]),
+		Daily:       ptrI64(data["dailyBalance"]),
+		Available:   ptrI64(data["currentBalance"]),
+		Permanent:   ptrI64(data["permanentBalance"]),
+		DailyQuota:  ptrI64(data["dailyQuota"]),
+		DailyUsed:   ptrI64(data["dailyConsumed"]),
+		CycleDate:   res.CycleDate,
+		RefreshedAt: time.Now().Unix(),
+	}
+	return res, nil
 }
 
 // Search 内置联网检索（腾讯搜索通道）。
@@ -432,6 +627,23 @@ func ptrI64(v any) *int64 {
 	}
 	n := int64(num(v))
 	return &n
+}
+
+// boolOf 宽松取布尔（兼容 JSON true/false 与 "true" 字符串）。
+func boolOf(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return t == "true" || t == "1"
+	}
+	return false
+}
+
+// mapOfAny 安全取嵌套对象（缺失或类型不符返回 nil）。
+func mapOfAny(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
 }
 
 func truncate(s string, n int) string {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/misakano7545/loomy2api-panel/internal/account"
+	"github.com/misakano7545/loomy2api-panel/internal/upstream"
 )
 
 // 冷却种类。
@@ -30,6 +31,7 @@ type Account struct {
 	LoginID  string `json:"loginid,omitempty"`
 	Password string `json:"password,omitempty"`
 	Enabled  bool   `json:"enabled"`
+	Paused   bool   `json:"paused,omitempty"` // 暂停选号：不参与转发，但照常签到/刷额度（保号）
 	Proxy    string `json:"proxy,omitempty"`
 
 	Session    string `json:"session,omitempty"`
@@ -39,11 +41,15 @@ type Account struct {
 
 	Identity account.Identity `json:"identity,omitempty"`
 
-	// 额度缓存（来自 /points/records）
-	Balance      *int64 `json:"balance,omitempty"`
-	DailyBalance *int64 `json:"daily_balance,omitempty"`
-	Available    *int64 `json:"available,omitempty"`
-	QuotaAt      int64  `json:"quota_updated_at,omitempty"`
+	// 额度缓存（来自 /points/records + /points/first-login）
+	Balance        *int64 `json:"balance,omitempty"`
+	DailyBalance   *int64 `json:"daily_balance,omitempty"`
+	Available      *int64 `json:"available,omitempty"`
+	Permanent      *int64 `json:"permanent,omitempty"`
+	DailyQuota     *int64 `json:"daily_quota,omitempty"`
+	DailyUsed      *int64 `json:"daily_used,omitempty"`
+	DailyCycleDate string `json:"daily_cycle_date,omitempty"`
+	QuotaAt        int64  `json:"quota_updated_at,omitempty"`
 
 	// 累计计数（落盘，重启不清零——用户对账要用）
 	Requests   int64 `json:"requests"`
@@ -136,7 +142,7 @@ func (a *Account) Healthy() bool {
 	a.rt.mu.Lock()
 	defer a.rt.mu.Unlock()
 	n := nowF()
-	return a.Enabled && a.SessionValid() && a.rt.cooldownUntil <= n && a.rt.breakerUntil <= n
+	return a.Enabled && !a.Paused && a.SessionValid() && a.rt.cooldownUntil <= n && a.rt.breakerUntil <= n
 }
 
 // HealthyForModel 模型感知的健康判定：被该模型限流的账号换模型仍可用。
@@ -384,6 +390,17 @@ func (a *Account) DailyConsumed() int64 {
 	return a.rt.dailyConsumed
 }
 
+// CheckinDone 今日是否已完成签到（额度快照的周期日 == 今天）。
+// 上游口径：每日登录后 first-login 自动刷新，dailyCycleDate 即为已签到凭证。
+func (a *Account) CheckinDone() bool {
+	a.rt.mu.Lock()
+	defer a.rt.mu.Unlock()
+	if a.DailyCycleDate == "" {
+		return false
+	}
+	return a.DailyCycleDate == time.Now().Format("2006-01-02")
+}
+
 // Public 面板/接口视图（无秘密）。
 func (a *Account) Public() map[string]any {
 	a.rt.mu.Lock()
@@ -418,18 +435,27 @@ func (a *Account) Public() map[string]any {
 	}
 	out := map[string]any{
 		"name":                  a.Name,
+		"uid":                   a.Name, // 面板统一身份键（蓝本 workbuddy 用 uid，Loomy 用账号名）
+		"nickname":              a.Name,
 		"loginid":               a.LoginID,
 		"userid":                a.UserID,
 		"enabled":               a.Enabled,
+		"paused":                a.Paused,
+		"disabled":              !a.Enabled,
 		"has_password":          a.Password != "",
 		"proxy":                 a.Proxy,
 		"session":               sess,
 		"session_valid":         a.SessionValid(),
 		"session_days_left":     nil,
 		"expire_at":             a.ExpireAt,
+		"checkin_done":          a.CheckinDone(),
 		"balance":               nil,
 		"daily_balance":         nil,
 		"available":             nil,
+		"permanent":             nil,
+		"daily_quota":           nil,
+		"daily_used":            nil,
+		"daily_cycle_date":      "",
 		"quota_updated_at":      a.QuotaAt,
 		"requests":              a.Requests,
 		"points_used":           a.PointsUsed,
@@ -466,16 +492,28 @@ func (a *Account) Public() map[string]any {
 	if a.Available != nil {
 		out["available"] = *a.Available
 	}
+	if a.Permanent != nil {
+		out["permanent"] = *a.Permanent
+	}
+	if a.DailyQuota != nil {
+		out["daily_quota"] = *a.DailyQuota
+	}
+	if a.DailyUsed != nil {
+		out["daily_used"] = *a.DailyUsed
+	}
+	out["daily_cycle_date"] = a.DailyCycleDate
 	return out
 }
 
-// SetQuota 更新额度缓存。
-func (a *Account) SetQuota(balance, daily, available *int64) {
+// SetQuota 更新额度缓存（来自 upstream.Quota 的真实快照）。
+func (a *Account) SetQuota(q *upstream.Quota) {
+	if q == nil {
+		return
+	}
 	a.rt.mu.Lock()
-	a.Balance = balance
-	a.DailyBalance = daily
-	a.Available = available
-	a.QuotaAt = time.Now().Unix()
+	a.Balance, a.DailyBalance, a.Available = q.Balance, q.Daily, q.Available
+	a.Permanent, a.DailyQuota, a.DailyUsed = q.Permanent, q.DailyQuota, q.DailyUsed
+	a.DailyCycleDate, a.QuotaAt = q.CycleDate, q.RefreshedAt
 	a.rt.mu.Unlock()
 }
 
@@ -523,6 +561,9 @@ func AccountFromMap(raw map[string]any, index int) *Account {
 	if v, ok := raw["enabled"]; ok {
 		acc.Enabled = toBool(v)
 	}
+	if v, ok := raw["paused"]; ok {
+		acc.Paused = toBool(v)
+	}
 	if ident, ok := raw["identity"].(map[string]any); ok {
 		acc.Identity = account.Identity{
 			DevID:     strOf(ident["devid"]),
@@ -533,7 +574,31 @@ func AccountFromMap(raw map[string]any, index int) *Account {
 			CreatedAt: int64Of(ident["created_at"]),
 		}
 	}
+	// 额度快照（见 persisted 注释：重启后不该归零）。
+	acc.Balance = ptrFrom(raw, "balance")
+	acc.DailyBalance = ptrFrom(raw, "daily_balance")
+	acc.Available = ptrFrom(raw, "available")
+	acc.Permanent = ptrFrom(raw, "permanent")
+	acc.DailyQuota = ptrFrom(raw, "daily_quota")
+	acc.DailyUsed = ptrFrom(raw, "daily_used")
+	acc.DailyCycleDate = strOf(raw["daily_cycle_date"])
+	acc.QuotaAt = int64Of(raw["quota_updated_at"])
 	return acc
+}
+
+// ptrFrom 从落盘 JSON 里取可选整数（缺失返回 nil——「未知」与「0」必须能区分，
+// 0 积分是真实状态，nil 是还没查过）。
+func ptrFrom(raw map[string]any, key string) *int64 {
+	v, ok := raw[key]
+	if !ok {
+		return nil
+	}
+	n, ok := v.(float64)
+	if !ok {
+		return nil
+	}
+	i := int64(n)
+	return &i
 }
 
 // ------------------------------------------------------------- persistence
@@ -546,6 +611,9 @@ func (a *Account) persisted() map[string]any {
 		"requests":   a.Requests,
 		"pointsUsed": a.PointsUsed,
 		"failures":   a.Failures,
+	}
+	if a.Paused {
+		out["paused"] = true
 	}
 	if a.LoginID != "" {
 		out["loginid"] = a.LoginID
@@ -571,6 +639,29 @@ func (a *Account) persisted() map[string]any {
 	if a.Identity.DevID != "" {
 		out["identity"] = a.Identity
 	}
+	// 额度快照：面板的「积分 / 每日签到 / 周期日」全靠它，不落盘就会在重启后
+	// 全部归零（面板显示 0 积分、未签到，直到下一次刷新）。上游查询很便宜但
+	// 重启瞬间没有它，用户会以为额度丢了。
+	a.rt.mu.Lock()
+	for key, v := range map[string]*int64{
+		"balance":       a.Balance,
+		"daily_balance": a.DailyBalance,
+		"available":     a.Available,
+		"permanent":     a.Permanent,
+		"daily_quota":   a.DailyQuota,
+		"daily_used":    a.DailyUsed,
+	} {
+		if v != nil {
+			out[key] = *v
+		}
+	}
+	if a.DailyCycleDate != "" {
+		out["daily_cycle_date"] = a.DailyCycleDate
+	}
+	if a.QuotaAt != 0 {
+		out["quota_updated_at"] = a.QuotaAt
+	}
+	a.rt.mu.Unlock()
 	return out
 }
 

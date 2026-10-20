@@ -373,6 +373,90 @@ func (l *Ledger) Hourly(hours int) []map[string]any {
 	return buckets
 }
 
+// HourlyRange 指定区间 [from,to]（unix 秒）的小时桶序列，面板用量图用。
+//
+// 与 Hourly 的区别：Hourly 永远是「现在往回 N 小时」的滚动窗口；这里按显式
+// 区间对齐——「今天」视图的柱子必须从本地 00:00 开始，而不是服务器滚动尾巴。
+// 区间超过 720 小时时自动加宽桶（按天聚合），保证桶数有界、标签不挤爆。
+func (l *Ledger) HourlyRange(from, to int64) []map[string]any {
+	l.mu.Lock()
+	snapshot := make([]Record, len(l.records))
+	copy(snapshot, l.records)
+	l.mu.Unlock()
+
+	if to <= 0 {
+		to = time.Now().Unix()
+	}
+	if from <= 0 {
+		// 「全部历史」：从最早一条记录起算（records 按写入序即时间序）。
+		if len(snapshot) > 0 {
+			from = snapshot[0].Time
+		} else {
+			from = to - 86400
+		}
+	}
+	if from > to {
+		from, to = to, from
+	}
+	span := to - from
+	width := int64(3600)
+	if span/width > 720 {
+		// 加宽到「天」桶：桶数超过 30 天时整图已经不可读，按天是最后的体面。
+		width = 86400
+	}
+
+	base := time.Unix(from, 0).In(time.Local)
+	if width == 3600 {
+		base = time.Date(base.Year(), base.Month(), base.Day(), base.Hour(), 0, 0, 0, time.Local)
+	} else {
+		base = time.Date(base.Year(), base.Month(), base.Day(), 0, 0, 0, 0, time.Local)
+	}
+	n := int((to-base.Unix())/width) + 1
+	if n < 1 {
+		n = 1
+	}
+	buckets := make([]map[string]any, n)
+	type agg struct {
+		requests   int
+		prompt     int64
+		completion int64
+		points     int64
+	}
+	data := make([]agg, n)
+	for _, r := range snapshot {
+		if r.Time < base.Unix() || r.Time > to {
+			continue
+		}
+		idx := int((r.Time - base.Unix()) / width)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= n {
+			idx = n - 1
+		}
+		data[idx].requests++
+		data[idx].prompt += r.Prompt
+		data[idx].completion += r.Completion
+		data[idx].points += r.Points
+	}
+	format := "01-02 15:00"
+	if width > 3600 {
+		format = "01-02"
+	}
+	for i := range buckets {
+		ts := base.Add(time.Duration(i) * time.Duration(width) * time.Second)
+		buckets[i] = map[string]any{
+			"hour":              ts.Format(format),
+			"requests":          data[i].requests,
+			"prompt_tokens":     data[i].prompt,
+			"completion_tokens": data[i].completion,
+			"tokens":            data[i].prompt + data[i].completion,
+			"points":            data[i].points,
+		}
+	}
+	return buckets
+}
+
 // Models 台账里出现过的模型名（去重排序）。
 func (l *Ledger) Models() []string {
 	l.mu.Lock()

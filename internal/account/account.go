@@ -239,6 +239,17 @@ func (c *Client) BaseInfo(session string, ident Identity) (map[string]any, error
 	return mapOf(out["data"]), nil
 }
 
+// ThirdInfo 查询第三方绑定信息（抓包核对：客户端登录成功后与 baseInfo 同批调用，
+// 未绑定时 data 为空数组）。
+func (c *Client) ThirdInfo(session string, ident Identity) (any, error) {
+	out, err := c.Call("/userinfo/query/thirdInfo", c.envelope(ident.orDefault(),
+		map[string]any{"session": session}))
+	if err != nil {
+		return nil, err
+	}
+	return out["data"], nil
+}
+
 // Logout 注销登录态。
 func (c *Client) Logout(session string, ident Identity) error {
 	_, err := c.Call("/login/account/logout", c.envelope(ident.orDefault(),

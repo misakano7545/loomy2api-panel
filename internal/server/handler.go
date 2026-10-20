@@ -254,6 +254,17 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 		if len(m.ReasoningTiers) > 0 {
 			item["reasoning_efforts"] = m.ReasoningTiers
 		}
+		if m.Type != "" {
+			item["type"] = m.Type
+		}
+		if m.IsFree {
+			// 限时免费（倍率 0 / 名称标注）：对外也标出来，客户端不必再解析展示名。
+			item["is_free"] = true
+			item["multiplier"] = 0
+		}
+		if m.IsDefault {
+			item["is_default_model"] = true
+		}
 		data = append(data, item)
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": data})

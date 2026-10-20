@@ -21,6 +21,15 @@ import (
 )
 
 func newTestPanel(t *testing.T) (*Panel, *pool.Pool) {
+	return newTestPanelFull(t, "https://upstream.invalid", "https://account.invalid")
+}
+
+func newTestPanelUpstream(t *testing.T, baseURL string) (*Panel, *pool.Pool) {
+	return newTestPanelFull(t, baseURL, "https://account.invalid")
+}
+
+// newTestPanelFull 同时注入上游与账号服务的假地址（短信登录类测试用）。
+func newTestPanelFull(t *testing.T, upstreamURL, accountURL string) (*Panel, *pool.Pool) {
 	t.Helper()
 	dir := t.TempDir()
 	cfg := config.Defaults()
@@ -36,8 +45,8 @@ func newTestPanel(t *testing.T) (*Panel, *pool.Pool) {
 		Enabled: true, Session: "sess-1", ExpireAt: expire, Available: &bal,
 	})
 
-	acc := account.NewClient("https://account.invalid", "APP", "ak", "sk", "")
-	up := upstream.NewClient("https://upstream.invalid", "0.9.38", "", 5*time.Second)
+	acc := account.NewClient(accountURL, "APP", "ak", "sk", "")
+	up := upstream.NewClient(upstreamURL, "0.9.38", "", 5*time.Second)
 	ledger := usage.New("", 100)
 	models := server.NewModelCache(up)
 
@@ -458,5 +467,114 @@ func TestUnknownPanelPath(t *testing.T) {
 	pl.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("状态码 %d，期望 404", w.Code)
+	}
+}
+
+// TestCheckinAccount 单号签到：调 first-login、写回额度快照、返回口径字段。
+func TestCheckinAccount(t *testing.T) {
+	var hit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "first-login") {
+			hit = true
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyProcessed":false,
+				"currentBalance":10000,"permanentBalance":5000,"dailyBalance":5000,
+				"dailyQuota":5000,"dailyConsumed":0,"dailyCycleDate":"2026-10-21"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/checkin", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+
+	if !hit {
+		t.Error("checkin 必须命中 points/first-login")
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d body %s", w.Code, w.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("不是 JSON: %v", err)
+	}
+	c, _ := out["checkin"].(map[string]any)
+	if c == nil || c["already_processed"] != false {
+		t.Errorf("checkin 字段不对: %v", out["checkin"])
+	}
+	if c["daily_quota"] != float64(5000) || c["current_balance"] != float64(10000) {
+		t.Errorf("checkin 口径不对: %v", c)
+	}
+	acc := p.Get("acc1")
+	if acc.DailyQuota == nil || *acc.DailyQuota != 5000 || acc.DailyCycleDate != "2026-10-21" {
+		t.Errorf("额度快照未写回账号: quota=%v cycle=%q", acc.DailyQuota, acc.DailyCycleDate)
+	}
+	if acc.Available == nil || *acc.Available != 10000 {
+		t.Errorf("可用总额未写回: %v", acc.Available)
+	}
+}
+
+// TestCheckinAccountUpstreamError 上游 401 时端点应回 502 而不是伪成功。
+func TestCheckinAccountUpstreamError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"code":"100002","desc":"缺少 token"}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/checkin", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("状态码 %d，期望 502", w.Code)
+	}
+	if p.Get("acc1").LastError() == "" {
+		t.Error("失败原因应记录到 last_error")
+	}
+}
+
+// TestCheckinAll 全量签到：只处理启用且会话有效的账号。
+func TestCheckinAll(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "first-login") {
+			hits++
+			_, _ = io.WriteString(w, `{"code":"000000","data":{"alreadyProcessed":true,
+				"currentBalance":10000,"permanentBalance":5000,"dailyBalance":5000,
+				"dailyQuota":5000,"dailyConsumed":0,"dailyCycleDate":"2026-10-21"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"code":"000000","data":{}}`)
+	}))
+	defer srv.Close()
+
+	pl, p := newTestPanelUpstream(t, srv.URL)
+	expired := time.Now().Add(-time.Hour).Unix()
+	p.Add(&pool.Account{Name: "acc2", Enabled: true, Session: "sess-2", ExpireAt: expired})
+	p.Add(&pool.Account{Name: "acc3", Enabled: false, Session: "sess-3", ExpireAt: time.Now().Add(72 * time.Hour).Unix()})
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/checkin_all", nil)
+	w := httptest.NewRecorder()
+	pl.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d body %s", w.Code, w.Body.String())
+	}
+	if hits != 1 {
+		t.Errorf("first-login 应只打 1 次（acc1），实际 %d", hits)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	results, _ := out["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("结果数 %d，期望 1（跳过过期与禁用）", len(results))
+	}
+	item, _ := results[0].(map[string]any)
+	if item["name"] != "acc1" || item["ok"] != true || item["granted"] != false {
+		t.Errorf("结果项不对: %v", item)
 	}
 }

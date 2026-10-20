@@ -44,6 +44,8 @@ type Panel struct {
 	// 账号级互斥：同一账号不允许并发跑登录/刷新等运维动作。
 	locksMu sync.Mutex
 	locks   map[string]*sync.Mutex
+
+	started time.Time
 }
 
 // New 构造面板。
@@ -52,9 +54,10 @@ func New(cfg *config.Config, p *pool.Pool, acc *account.Client, up *upstream.Cli
 	pl := &Panel{
 		cfg: cfg, pool: p, accounts: acc, upstream: up,
 		ledger: ledger, models: models, version: version,
-		mux:   http.NewServeMux(),
-		ring:  NewRing(500),
-		locks: map[string]*sync.Mutex{},
+		mux:     http.NewServeMux(),
+		ring:    NewRing(500),
+		locks:   map[string]*sync.Mutex{},
+		started: time.Now(),
 	}
 	pl.routes()
 	return pl
@@ -79,7 +82,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.listAccounts))
 	p.mux.HandleFunc("POST /panel/api/accounts", p.withAuth(p.addAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/login", p.withAuth(p.loginAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/checkin", p.withAuth(p.checkinAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/balance", p.withAuth(p.refreshAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/refresh", p.withAuth(p.refreshAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/pause", p.withAuth(p.pauseAccount))
+	p.mux.HandleFunc("POST /panel/api/accounts/{name}/resume", p.withAuth(p.resumeAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/enable", p.withAuth(p.enableAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/disable", p.withAuth(p.disableAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/revive", p.withAuth(p.reviveAccount))
@@ -87,10 +94,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/accounts/{name}/points", p.withAuth(p.accountPoints))
 
 	p.mux.HandleFunc("POST /panel/api/refresh_all", p.withAuth(p.refreshAll))
+	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/login_all", p.withAuth(p.loginAll))
 
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsHandler))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageHandler))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packagesHandler))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistoryHandler))
+	p.mux.HandleFunc("POST /panel/api/sms/send", p.withAuth(p.smsSendHandler))
+	p.mux.HandleFunc("POST /panel/api/sms/login", p.withAuth(p.smsLoginHandler))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummaryHandler))
 	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.requests))
@@ -130,12 +142,37 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	ov["listen"] = p.cfg.Listen
 	ov["upstream"] = p.cfg.Upstream
 	ov["default_model"] = p.cfg.DefaultModel
+	// 蓝本对齐字段：粘性会话计数 / 运行时长 / 模型锁池 / 账号列表（含每号 24h 用量）。
+	ov["sticky_sessions"] = p.pool.Sticky().Snapshot()["entries"]
+	ov["uptime_sec"] = int(time.Since(p.started).Seconds())
+	ov["model_locks"] = p.pool.ModelLockView()
+	ov["accounts"] = p.accountRows24h()
 
 	windows := map[string]int64{"24h": 86400, "today": todaySeconds(), "3d": 3 * 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 	sum := p.ledger.Summary(windows)
 	ov["usage"] = sum
 	ov["hourly"] = p.ledger.Hourly(24)
 	writeJSON(w, http.StatusOK, ov)
+}
+
+// accountRows24h 账号 Public 视图 + 台账 24h 观测（token/延迟/速率/最近成功）。
+func (p *Panel) accountRows24h() []map[string]any {
+	usage24 := p.ledger.Summary(map[string]int64{"24h": 86400})["24h"]
+	rows := make([]map[string]any, 0, p.pool.Count())
+	for _, a := range p.pool.All() {
+		pub := a.Public()
+		if b := usage24.ByAccount[a.Name]; b != nil {
+			pub["token_usage"] = map[string]any{
+				"request_count":   b.Requests,
+				"total_tokens":    b.Prompt + b.Completion,
+				"last_latency_ms": b.AvgLatencyMs,
+			}
+			pub["success_count"] = b.OK
+			pub["err_total"] = b.Fail
+		}
+		rows = append(rows, pub)
+	}
+	return rows
 }
 
 func (p *Panel) listAccounts(w http.ResponseWriter, r *http.Request) {
@@ -154,21 +191,42 @@ func (p *Panel) modelsHandler(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) usageHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	from, to := parseRange(q.Get("from"), q.Get("to"))
+	hoursReq := 0
+	hoursSet := false
+	if v := q.Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 24*30 {
+			hoursReq, hoursSet = n, true
+		}
+	}
+	if to == 0 {
+		to = time.Now().Unix()
+	}
+	// 「全部历史」（hours=0）：窗口与时序都走显式区间 [0,now]——若落到默认分支
+	// 会静默退回 7d/24h（蓝本 issue #121 的同族坑：空查询≠全部）。
+	allHistory := hoursSet && hoursReq == 0
 	var win *usage.Window
-	if from > 0 || to > 0 {
+	switch {
+	case from > 0 || allHistory:
 		win = p.ledger.Range(from, to)
-	} else {
+	default:
 		win = p.ledger.Summary(map[string]int64{"7d": 7 * 86400})["7d"]
 	}
-	hours := 24
-	if v := q.Get("hours"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 24*30 {
-			hours = n
+	// 时序桶：显式区间走 HourlyRange（柱子按用户选的起点排列，「今天」从 00:00
+	// 开始）；其余滚动窗口走 Hourly（服务端整点对齐，与旧行为逐位一致）。
+	var series []map[string]any
+	switch {
+	case from > 0 || allHistory:
+		series = p.ledger.HourlyRange(from, to)
+	default:
+		hours := 24
+		if hoursSet && hoursReq > 0 {
+			hours = hoursReq
 		}
+		series = p.ledger.Hourly(hours)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"window": win,
-		"hourly": p.ledger.Hourly(hours),
+		"hourly": series,
 		"models": p.ledger.Models(),
 	})
 }
@@ -218,6 +276,12 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体必须是对象: "+err.Error())
 		return
+	}
+	// 追加网关密钥：面板读到的是脱敏列表，无法把原列表回传——用专用键交后端合并。
+	if add, _ := patch["_add_api_key"].(string); strings.TrimSpace(add) != "" {
+		delete(patch, "_add_api_key")
+		merged := append(append([]string{}, p.cfg.APIKeys...), strings.TrimSpace(add))
+		patch["api_keys"] = merged
 	}
 	restart, err := p.cfg.Save(patch)
 	if err != nil {
@@ -288,7 +352,7 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	p.persist(acc)
 	p.Logf("新增账号 %s（登录态 %v）", acc.Name, acc.SessionValid())
-	go p.refreshQuota(acc)
+	go p.checkinAndRefresh(acc)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
@@ -316,8 +380,109 @@ func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
 	acc.ResetCooldowns()
 	p.persist(acc)
 	p.Logf("账号 %s 登录成功（14 天有效）", name)
-	go p.refreshQuota(acc)
+	go p.checkinAndRefresh(acc)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
+}
+
+// checkinAccount 单号签到/领取每日积分（官方客户端同款 first-login，幂等）。
+func (p *Panel) checkinAccount(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	acc := p.pool.Get(name)
+	if acc == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	res, err := p.doCheckinCtx(ctx, acc)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	p.persist(acc)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "account": acc.Public(),
+		"checkin": map[string]any{
+			"already_processed": res.AlreadyProcessed,
+			"daily_quota":       res.DailyQuota,
+			"daily_consumed":    res.DailyConsumed,
+			"daily_balance":     res.DailyBalance,
+			"permanent_balance": res.PermanentBalance,
+			"current_balance":   res.CurrentBalance,
+			"daily_cycle_date":  res.CycleDate,
+			"invitation_codes":  res.InvitationCodes,
+		},
+	})
+}
+
+// checkinAll 全池签到：对每个会话有效的账号调一次 first-login。
+func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+	accounts := p.pool.All()
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	type result struct {
+		Name    string `json:"name"`
+		OK      bool   `json:"ok"`
+		Granted bool   `json:"granted"` // 本次真正领到了新周期额度
+		Error   string `json:"error,omitempty"`
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	var mu sync.Mutex
+	var results []result
+
+	for _, a := range accounts {
+		if !a.Enabled || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			res, err := p.doCheckinCtx(ctx, a)
+			mu.Lock()
+			defer mu.Unlock()
+			item := result{Name: a.Name, OK: err == nil}
+			if err != nil {
+				item.Error = err.Error()
+			} else {
+				item.Granted = res != nil && !res.AlreadyProcessed
+				p.persist(a)
+			}
+			results = append(results, item)
+		}(a)
+	}
+	wg.Wait()
+	okCount := 0
+	for _, res := range results {
+		if res.OK {
+			okCount++
+		}
+	}
+	p.Logf("全量签到：成功 %d / %d", okCount, len(results))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
+}
+
+// doCheckinCtx 领取每日赠送积分（幂等），成功后把口径快照写回账号。
+func (p *Panel) doCheckinCtx(ctx context.Context, acc *pool.Account) (*upstream.CheckinResult, error) {
+	if !acc.SessionValid() {
+		return nil, fmt.Errorf("登录态已失效，需要重新登录")
+	}
+	res, err := p.upstream.Checkin(ctx, acc.Session)
+	if err != nil {
+		acc.SetLastError("签到失败: " + err.Error())
+		return nil, err
+	}
+	acc.SetQuota(res.Quota)
+	verb := "已领取新额度"
+	if res.AlreadyProcessed {
+		verb = "本周期已领过"
+	}
+	p.Logf("账号 %s 签到：%s（每日 %d/%d，长期 %d，可用 %d）", acc.Name,
+		verb, res.DailyQuota-res.DailyConsumed, res.DailyQuota, res.PermanentBalance, res.CurrentBalance)
+	return res, nil
 }
 
 func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +609,8 @@ func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
 
 func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
 	accounts := p.pool.All()
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	defer cancel()
 	type result struct {
 		Name  string `json:"name"`
 		OK    bool   `json:"ok"`
@@ -471,6 +638,12 @@ func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
 				res.Error = err.Error()
 			} else {
 				p.persist(a)
+				// 模拟真实客户端：登录成功后立刻领每日积分并刷额度。
+				if _, cerr := p.doCheckinCtx(ctx, a); cerr != nil {
+					p.Logf("账号 %s 登录后签到失败：%v", a.Name, cerr)
+				} else {
+					p.persist(a)
+				}
 			}
 			results = append(results, res)
 		}(a)
@@ -516,15 +689,33 @@ func (p *Panel) refreshQuota(acc *pool.Account) {
 	p.persist(acc)
 }
 
+// checkinAndRefresh 复刻真实客户端的登录后动作链：先调 first-login 领每日积分
+// （幂等，失败不阻断），再拉一次完整额度快照落盘。
+func (p *Panel) checkinAndRefresh(acc *pool.Account) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := p.doCheckinCtx(ctx, acc); err != nil {
+		p.Logf("账号 %s 登录后签到失败：%v", acc.Name, err)
+	} else {
+		p.persist(acc)
+	}
+	// 签到成功时 SetQuota 已写入 first-login 口径；这里补 records 侧余额。
+	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
+		p.Logf("账号 %s 额度刷新失败：%v", acc.Name, err)
+		return
+	}
+	p.persist(acc)
+}
+
 func (p *Panel) refreshQuotaCtx(ctx context.Context, acc *pool.Account) error {
 	if !acc.SessionValid() {
 		return fmt.Errorf("登录态已失效，需要重新登录")
 	}
-	balance, daily, available, err := p.upstream.Quota(ctx, acc.Session)
+	balance, err := p.upstream.Quota(ctx, acc.Session)
 	if err != nil {
 		return err
 	}
-	acc.SetQuota(balance, daily, available)
+	acc.SetQuota(balance)
 	return nil
 }
 
