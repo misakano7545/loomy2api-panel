@@ -161,13 +161,11 @@ func TestPanelAuthEnforced(t *testing.T) {
 	}
 }
 
-// TestPanelAcceptsAPIKeyAndPassword 登录框写的是「api_key / 面板密码」，两者都
-// 必须能进；只有错误的密钥才该 401。之前设了 panel_password 就把 api_key 完全
-// 忽略，用户贴 key 会被莫名拒绝。
-func TestPanelAcceptsAPIKeyAndPassword(t *testing.T) {
+// TestPanelAuthUsesAPIKey 面板与 /v1/* 共用 api_key（参考面板只有一个 key 输入框）。
+// 曾自创过独立的 panel_password，导致用户贴 key 被 401。
+func TestPanelAuthUsesAPIKey(t *testing.T) {
 	pl, _ := newTestPanel(t)
 	pl.cfg.APIKeys = []string{"sk-api"}
-	pl.cfg.PanelPass = "panel-pw"
 
 	for _, tc := range []struct {
 		name string
@@ -175,7 +173,6 @@ func TestPanelAcceptsAPIKeyAndPassword(t *testing.T) {
 		want int
 	}{
 		{"api_key 放行", "sk-api", http.StatusOK},
-		{"面板密码放行", "panel-pw", http.StatusOK},
 		{"错误密钥拒绝", "sk-nope", http.StatusUnauthorized},
 		{"空密钥拒绝", "", http.StatusUnauthorized},
 	} {

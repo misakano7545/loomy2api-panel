@@ -8,8 +8,6 @@
   "api_keys": [],
   "_api_keys": "网关密钥列表，空 = 不鉴权（仅限本机/内网）。可用 LOOMY_API_KEYS 逗号分隔覆盖",
 
-  "panel_password": "",
-  "_panel_password": "面板独立密码；设了就只认它，空则沿用 api_keys",
 
   "auth_dir": "./auths",
   "_auth_dir": "[重启] 账号凭证目录（每个账号一个 json，0600）",

@@ -242,7 +242,6 @@ func TestSavePreservesUnknownKeys(t *testing.T) {
 func TestPublicMasksSecrets(t *testing.T) {
 	c := Defaults()
 	c.APIKeys = []string{"sk-abcdefghijklmnop"}
-	c.PanelPass = "super-secret"
 	c.AccessKeySec = "very-secret"
 
 	pub := c.Public()
@@ -252,9 +251,6 @@ func TestPublicMasksSecrets(t *testing.T) {
 	}
 	if strings.Contains(keys[0].(string), "abcdefghijklmnop") {
 		t.Errorf("api_key 未脱敏: %v", keys[0])
-	}
-	if pw := pub["panel_password"].(string); strings.Contains(pw, "super-secret") {
-		t.Errorf("面板密码未脱敏: %v", pw)
 	}
 	if sec := pub["access_key_secret"].(string); strings.Contains(sec, "very-secret") {
 		t.Errorf("access key secret 未脱敏: %v", sec)

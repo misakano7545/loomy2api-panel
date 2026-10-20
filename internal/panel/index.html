@@ -915,12 +915,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">监听地址</span>
                 <input name="listen" placeholder=":17890">
                 <span class="hint">[重启] 改动需重启进程</span></label>
-              <label class="fld"><span class="lb">追加 API 密钥（网关 + 面板共用口径）</span>
+              <label class="fld"><span class="lb">追加 API 密钥（网关 + 面板共用同一把）</span>
                 <input name="apikey_add" id="cfgApiKey" placeholder="留空 = 不修改现有密钥">
-                <span class="hint">写入 api_keys；新密钥立即生效，用新密钥登录后本机自动换存</span></label>
-              <label class="fld"><span class="lb">面板独立密码</span>
-                <input name="panel_password" id="cfgPanelPass" type="password" placeholder="留空 = 不修改（沿用 api_keys）">
-                <span class="hint">设了就只认它。保存后需以新密码重新进入</span></label>
+                <span class="hint">写入 api_keys；面板登录也用这把，保存后立即生效</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid3">
@@ -1182,10 +1179,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg" style="width:420px">
     <header>
       <h3>需要访问密钥</h3>
-      <div class="hint">该网关已启用鉴权：请输入 config.json 的 api_key（或面板密码）。</div>
+      <div class="hint">该网关已启用鉴权：请输入 config.json 里的 api_key（面板与 /v1 共用同一把）。</div>
     </header>
     <div class="body">
-      <input type="password" id="keyInput" placeholder="api_key / 面板密码" autocomplete="off">
+      <input type="password" id="keyInput" placeholder="api_key" autocomplete="off">
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>

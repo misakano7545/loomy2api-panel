@@ -116,16 +116,11 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// withAuth 鉴权包装。登录框写的是「api_key / 面板密码」，所以两者都收：
-// panel_password 设了仍然有效，但 api_key 也照样能进（api_key 本来就能打
-// /v1/*，面板不是更高的信任级别）。只认其中一个会让用户贴 key 时被莫名拒绝。
+// withAuth 鉴权包装。面板与 /v1/* 用同一把 api_key：参考面板只有一个 key 输入框，
+// 不另设面板密码（曾自创过 panel_password，结果用户贴 key 被拒）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		keys := p.cfg.APIKeys
-		if p.cfg.PanelPass != "" {
-			keys = append(append([]string{}, p.cfg.APIKeys...), p.cfg.PanelPass)
-		}
-		if !httpauth.Verify(r, keys) {
+		if !httpauth.Verify(r, p.cfg.APIKeys) {
 			writeErr(w, http.StatusUnauthorized, "invalid key")
 			return
 		}
@@ -139,7 +134,6 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	ov := p.pool.Overview()
 	ov["version"] = p.version
 	ov["api_key_set"] = len(p.cfg.APIKeys) > 0
-	ov["panel_password_set"] = p.cfg.PanelPass != ""
 	ov["listen"] = p.cfg.Listen
 	ov["upstream"] = p.cfg.Upstream
 	ov["default_model"] = p.cfg.DefaultModel

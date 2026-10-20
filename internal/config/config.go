@@ -73,8 +73,7 @@ type Model struct {
 // Config 全量配置。字段名即 config.json 的键名（独立结构体便于面板表单绑定）。
 type Config struct {
 	Listen    string   `json:"listen"`
-	APIKeys   []string `json:"api_keys"`       // 空 = 不鉴权
-	PanelPass string   `json:"panel_password"` // 空 = 面板不登录（仅限内网）
+	APIKeys   []string `json:"api_keys"` // 空 = 不鉴权；面板登录也用这把
 	AuthDir   string   `json:"auth_dir"`
 	StateFile string   `json:"state_file"`
 	LogDir    string   `json:"log_dir"`
@@ -235,7 +234,6 @@ func mergeJSON(cfg *Config, raw map[string]any) error {
 var envMap = map[string]string{
 	"LOOMY_LISTEN":          "listen",
 	"LOOMY_API_KEYS":        "api_keys",
-	"LOOMY_PANEL_PASSWORD":  "panel_password",
 	"LOOMY_AUTH_DIR":        "auth_dir",
 	"LOOMY_STATE_FILE":      "state_file",
 	"LOOMY_UPSTREAM":        "upstream",
@@ -475,9 +473,6 @@ func (c *Config) Public() map[string]any {
 			masked = append(masked, s)
 		}
 		m["api_keys"] = masked
-	}
-	if pw, _ := m["panel_password"].(string); pw != "" {
-		m["panel_password"] = "…（已设置）"
 	}
 	if sec, _ := m["access_key_secret"].(string); sec != "" {
 		m["access_key_secret"] = "…（已设置）"

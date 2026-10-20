@@ -289,7 +289,7 @@ $('btnKey').onclick = async () => {
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
-// 登出：api_key / 面板密码是唯一凭据（服务端只做 Bearer 比对，无会话无 cookie 可失效），
+// 登出：api_key 是唯一凭据（服务端只做 Bearer 比对，无会话无 cookie 可失效），
 // 所以"登出"= 清掉本机保存的密钥并重载——重载把内存里的定时器与已渲染数据一并清空，
 // 无密钥时 start() 的首次请求 401 会自动弹回密钥门（data-lock="1"，不可绕过）。
 $('btnLogout').onclick = () => {
@@ -913,7 +913,7 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 /* CFG_MAP：面板字段 → config.json 键。Loomy 配置是扁平 JSON（蓝本是嵌套分组），
-   直接键名映射；api_keys / panel_password 走专用控件（脱敏值不下发，见下）。 */
+   直接键名映射；api_keys 走专用控件（脱敏值不下发，见下）。面板登录与 /v1/* 用同一把 key。 */
 const CFG_MAP = {
   listen: 'listen', default_model: 'default_model', strategy: 'strategy',
   pick_top_n: 'pick_top_n', max_inflight_per_account: 'max_inflight_per_account',
@@ -977,8 +977,6 @@ function collectConfig() {
   const extraKey = ($('cfgApiKey') && $('cfgApiKey').value || '').trim();
   // 服务端读到的是脱敏列表，前端无法回传原文——_add_api_key 由后端合并进 api_keys。
   if (extraKey) out._add_api_key = extraKey;
-  const pp = ($('cfgPanelPass') && $('cfgPanelPass').value || '').trim();
-  if (pp && !isMasked(pp)) out.panel_password = pp;
   return out;
 }
 // 数值字段即时校验：非空必须是有限数（保存被拒不如就地标红）。

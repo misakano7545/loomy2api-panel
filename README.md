@@ -145,7 +145,6 @@ curl http://127.0.0.1:17890/v1/responses \
 |---|---|---|
 | `listen` | `:17890` | 监听地址（改动需重启） |
 | `api_keys` | `[]` | 网关密钥，空 = 不鉴权（**勿暴露公网**） |
-| `panel_password` | `""` | 面板密码；设了就只认它，否则沿用 `api_keys` |
 | `auth_dir` | `./auths` | 账号凭证目录（改动需重启） |
 | `state_file` | `./data/state.json` | 池状态文件（改动需重启） |
 | `upstream` | `https://loomyad.xunfei.cn/api/v1` | 上游模型网关（改动需重启） |
@@ -214,7 +213,7 @@ gofmt -l .            # 格式检查（应无输出）
   「登录态 14 天到期后无人值守自动重登」的必要代价——上游没有 refresh token。
   请确保该目录不在备份 / 同步盘的共享范围内。
 - **鉴权**：`api_keys` 为空时 `/v1/*` 与 `/panel/api/*` **完全不鉴权**，仅适合
-  `127.0.0.1` 本机或可信内网。放到公网前必须设置 `api_keys` 或 `panel_password`。
+  `127.0.0.1` 本机或可信内网。放到公网前必须设置 `api_keys`（面板登录与 `/v1/*` 用同一把）。
 - **面板**：内嵌页带严格 CSP（`default-src 'none'`、无内联脚本）、`X-Frame-Options: DENY`、
   `Referrer-Policy: no-referrer`；配置视图与账号视图都不回显密钥或完整 session。
 - **合规边界**：本项目是个人自用的协议互操作实现，**不得用于贩卖、共享他人账号、
