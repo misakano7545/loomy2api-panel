@@ -138,6 +138,8 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 	defer quota.Stop()
 	gc := time.NewTicker(5 * time.Minute)
 	defer gc.Stop()
+	// expiredWarned 记录每个账号最近一次登录态告警日期，避免同一账号反复刷屏。
+	expiredWarned := map[string]string{}
 
 	for {
 		select {
@@ -148,13 +150,26 @@ func background(cfg *config.Config, p *pool.Pool, up *upstream.Client, pl *panel
 				log.Printf("会话粘性：清理 %d 条过期绑定", n)
 			}
 			// 登录态即将过期提醒（Loomy 没有 refresh token，只能重登）。
+			// 阈值取 config.session_renew_before_days；每个账号每天只提醒一次，
+			// 否则 5 分钟一轮会把日志刷满。
+			warnDays := cfg.SessionRenewDays
+			if warnDays <= 0 {
+				warnDays = 3
+			}
+			today := time.Now().Format("2006-01-02")
 			for _, a := range p.All() {
 				if !a.Enabled {
 					continue
 				}
-				if d := a.DaysLeft(); d >= 0 && d < 1 {
-					log.Printf("⚠️  账号 %s 登录态将在 %.1f 小时内过期，请重新登录", a.Name, d*24)
+				d := a.DaysLeft()
+				if d < 0 || d >= float64(warnDays) {
+					continue
 				}
+				if expiredWarned[a.Name] == today {
+					continue
+				}
+				expiredWarned[a.Name] = today
+				log.Printf("⚠️  账号 %s 登录态将在 %.1f 小时内过期（阈值 %d 天），请重新登录", a.Name, d*24, warnDays)
 			}
 		case <-quota.C:
 			refreshQuotas(p, up)

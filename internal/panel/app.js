@@ -25,7 +25,7 @@ let refTimer = null;
 let smsMsgID = '';
 /* 视图级筛选状态（模块级声明放文件顶部，避开顶层 go() 早于声明执行的 TDZ）。 */
 let mdAll = [];
-let mdFilter = { q: '', cap: '', sort: 'default' };
+let mdFilter = { q: '', cap: '', effort: '', promo: '', sort: 'default' };
 let usDim = 'account', usCreditDim = 'account', usSort = 'total';
 let usageData = null;
 let reqFilter = { q: '', outcome: '' };
@@ -254,6 +254,11 @@ function fmtTok(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
   return String(n);
 }
+function fmtRate(v) {
+  const n = Number(v || 0);
+  if (!n || !Number.isFinite(n)) return '—';
+  return (n >= 100 ? Math.round(n) : n.toFixed(1)) + ' tok/s';
+}
 function fmtMs(ms) {
   ms = Number(ms || 0);
   if (!ms) return '—';
@@ -377,12 +382,16 @@ function renderAccounts(list) {
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const latency = fmtMs(tu.last_latency_ms);
-    const usageTitle = '24h：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency;
+    const rate = fmtRate(tu.last_tokens_per_second);
+    // 参考面板「用量」是累计口径（台账全历史），不是某个时间窗。
+    const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
+      (rate === '—' ? '' : ' / ' + rate);
     const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
     return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
-      '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) + '</div></td>' +
+      '<div class="id">' + esc(s.loginid || (s.userid ? 'uid ' + s.userid : '—')) +
+      (s.session_days_left == null ? '' : ' · 登录态 ' + days) + '</div></td>' +
       '<td>' + st.tag + err + locks + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + fmtPoints(avail) +
       (s.permanent != null && s.daily_balance != null
@@ -394,8 +403,9 @@ function renderAccounts(list) {
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + fmtTok(tu.total_tokens) + '</b><em>tok</em></span>' +
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
+        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + days + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success ? new Date(s.last_success * 1000).toISOString() : '') + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.name) + '">余额</button>' +
@@ -405,8 +415,7 @@ function renderAccounts(list) {
           : (s.paused
             ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.name) + '">恢复选号</button>'
             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.name) + '" title="退出选号，但照常签到 / 刷新余额">暂停选号</button>')) +
-        (s.disabled ? '<button class="xs ghost" data-a="enable" data-u="' + esc(s.name) + '">启用</button>'
-                    : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.name) + '">禁用</button>') +
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.name) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.name) + '">移除</button>' +
       '</td></tr>';
   }).join('');
@@ -437,6 +446,33 @@ function renderModelLocks(rows) {
   $('mlNote').textContent = list.length + ' 个模型受限';
 }
 
+// renderExpiry 积分到期提醒（参考面板同区块）：Loomy 只有「每日赠送」会随周期失效，
+// 长期积分不到期。到期日 = daily_cycle_date 的次日 00:00；同一天的多个账号合并成一行。
+function renderExpiry(accounts) {
+  const rows = [];
+  for (const a of (accounts || [])) {
+    const bal = Number(a.daily_balance || 0);
+    if (!bal || !a.daily_cycle_date) continue;
+    const cyc = new Date(a.daily_cycle_date + 'T00:00:00');
+    if (isNaN(cyc.getTime())) continue;
+    const exp = new Date(cyc.getTime() + 86400000);
+    const days = Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000));
+    rows.push({ name: a.name, exp, days, remain: bal });
+  }
+  rows.sort((x, y) => x.exp - y.exp);
+  const tb = $('expBody');
+  if (!tb) return;
+  tb.innerHTML = !rows.length
+    ? '<tr><td colspan="5"><div class="empty">暂无未来到期批次（长期积分不到期，每日额度为 0 时不入表）</div></td></tr>'
+    : rows.map(r => '<tr><td class="who"><div class="nm">' + esc(r.name) + '</div></td>' +
+        '<td>' + r.exp.toLocaleDateString('zh-CN') + '</td>' +
+        '<td class="num">' + (r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天') + '</td>' +
+        '<td class="num">' + fmtPoints(r.remain) + '</td>' +
+        '<td class="num">' + fmtPoints(Math.ceil(r.remain / Math.max(1, r.days))) + '</td></tr>').join('');
+  const total = rows.reduce((s, r) => s + r.remain, 0);
+  if ($('expNote')) $('expNote').textContent = rows.length ? rows.length + ' 个账号 · 合计 ' + fmtPoints(total) : '—';
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -452,6 +488,7 @@ async function loadOverview(quiet) {
     $('sSticky').textContent = d.sticky_sessions == null ? '-' : d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
+    renderExpiry(d.accounts);
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
@@ -490,9 +527,6 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
-    } else if (a === 'enable') {
-      await api('accounts/' + encodeURIComponent(u) + '/enable', { method: 'POST' });
-      toast('已启用', 'ok');
     } else if (a === 'pause') {
       await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
       toast('已暂停选号（签到 / 刷额度照常）', 'ok');
@@ -527,22 +561,11 @@ $('btnRefreshAll').onclick = async () => {
   const btn = $('btnRefreshAll');
   btn.disabled = true; btn.textContent = '刷新中…';
   try {
-    const d = await api('refresh_all', { method: 'POST' });
+    const d = await api('balance_all', { method: 'POST' });
     const rs = d.results || [];
     toast('额度刷新完成：' + rs.filter(r => r.ok).length + '/' + rs.length, 'ok');
   } catch (e) { toast(e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '全部刷新额度'; loadOverview(true); }
-};
-$('btnLoginAll').onclick = async () => {
-  const btn = $('btnLoginAll');
-  btn.disabled = true; btn.textContent = '登录中…';
-  try {
-    const d = await api('login_all', { method: 'POST' });
-    const rs = d.results || [];
-    const ok = rs.filter(r => r.ok).length;
-    toast('全部重新登录：成功 ' + ok + ' / ' + rs.length + '（成功号已自动签到）', ok ? 'ok' : 'err');
-  } catch (e) { toast(e.message, 'err'); }
-  finally { btn.disabled = false; btn.textContent = '全部重新登录'; loadOverview(true); }
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
@@ -585,23 +608,26 @@ function mdMatch(m, f) {
       if (!text.includes(kw)) return false;
     }
   }
-  if (f.cap === 'free' && !m.is_free) return false;
   if (f.cap === 'tool' && !(m.capabilities || []).includes('function_calling') &&
       !(m.capabilities || []).includes('tool')) return false;
   if (f.cap === 'vision' && !(m.capabilities || []).includes('vision') &&
       !(m.capabilities || []).includes('image')) return false;
   if (f.cap === 'reasoning' && !(m.reasoning_efforts || []).length) return false;
-  if (f.cap === 'image' && (m.type || '') !== 'image') return false;
+  if (f.cap === 'default' && !m.is_default_model) return false;
+  const effs = m.reasoning_efforts || [];
+  if (f.effort === 'off' && !effs.includes('none')) return false;
+  if (f.effort && f.effort !== 'off' && !effs.includes(f.effort)) return false;
+  // 价格口径：限免 = is_free；打折 = 有倍率且 < 1（GLM x0.8 这类）；无倍率不算打折。
+  if (f.promo === 'free' && !m.is_free) return false;
+  if (f.promo === 'discount' && (m.is_free || !(Number(m.multiplier) > 0 && Number(m.multiplier) < 1))) return false;
+  if (f.promo === 'promo' && !(m.is_free || (Number(m.multiplier) > 0 && Number(m.multiplier) < 1))) return false;
   return true;
 }
 function mdSortList(list, f) {
   f = f || mdFilter;
   const out = list.slice();
   const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
-  if (f.sort === 'free') {
-    // 限免优先：同组内按倍率升序，方便一眼挑出「免费能用」的。
-    out.sort((a, b) => (Number(!!b.is_free) - Number(!!a.is_free)) || (num(a.multiplier) - num(b.multiplier)));
-  } else if (f.sort === 'rate') out.sort((a, b) => (num(a.multiplier) || Infinity) - (num(b.multiplier) || Infinity));
+  if (f.sort === 'rate') out.sort((a, b) => (num(a.multiplier) || Infinity) - (num(b.multiplier) || Infinity));
   else if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
   else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
   else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
@@ -631,14 +657,17 @@ function mdRowHtml(m) {
     : (m.multiplier ? 'x' + Number(m.multiplier).toFixed(1) : '—');
   const defTag = m.is_default_model ? '<span class="tag ok" title="上游默认模型">默认</span>' : '';
   const typeTag = (m.type === 'image') ? '<span class="tag mute">图像</span>' : '';
-  const dflt = m.default_reasoning_effort ? '<div class="id">默认档 ' + esc(m.default_reasoning_effort) + '</div>' : '';
+  const dflt = m.default_reasoning_effort
+    ? '<span class="tag mute" title="上游默认思考档">' + esc(m.default_reasoning_effort) + '</span>'
+    : '—';
   return '<tr><td class="mark" aria-hidden="true"><i></i></td>' +
     '<td class="who"><div class="nm"><span class="mid">' + esc(m.id) + '</span>' + defTag + typeTag + '</div>' +
     '<div class="id">' + esc(mdBaseName(m.name) || '') + '</div>' + capHtml + '</td>' +
     '<td class="num">' + rate + '</td>' +
+    '<td>' + dflt + '</td>' +
+    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
     '<td class="num">' + (m.context_length ? fmtK(m.context_length) : '—') + '</td>' +
-    '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>' +
-    '<td class="efs" style="white-space:normal">' + effs + dflt + '</td></tr>';
+    '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td></tr>';
 }
 function renderModels() {
   const tb = $('mdBody');
@@ -657,8 +686,9 @@ function renderModels() {
   $('mdCount').className = filtered ? 'note src-off' : 'note';
 }
 function resetModelFilter() {
-  mdFilter = { q: '', cap: '', sort: 'default' };
-  $('mdQ').value = ''; $('mdCap').value = ''; $('mdSort').value = 'default';
+  mdFilter = { q: '', cap: '', effort: '', promo: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdCap').value = ''; $('mdEffort').value = '';
+  $('mdPromo').value = ''; $('mdSort').value = 'default';
   renderModels();
 }
 
@@ -668,7 +698,7 @@ $('mdQ').oninput = () => {
   clearTimeout(mdQTimer);
   mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
 };
-for (const [id, key] of [['mdCap', 'cap'], ['mdSort', 'sort']]) {
+for (const [id, key] of [['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
   const el = $(id);
   if (!el) continue;
   el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
@@ -958,6 +988,9 @@ async function loadConfig() {
       if (el.type === 'checkbox') el.checked = !!v;
       else el.value = v == null ? '' : v;
     }
+    // API 密钥单独填：服务端已改成明文下发（参考面板同款），有「显示」按钮。
+    const keys = Array.isArray(cfgLoaded.api_keys) ? cfgLoaded.api_keys : [];
+    if ($('cfgKey')) $('cfgKey').value = keys[0] || '';
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -974,9 +1007,8 @@ function collectConfig() {
       if (Number.isFinite(n)) out[key] = n;
     } else out[key] = raw;
   }
-  const extraKey = ($('cfgApiKey') && $('cfgApiKey').value || '').trim();
-  // 服务端读到的是脱敏列表，前端无法回传原文——_add_api_key 由后端合并进 api_keys。
-  if (extraKey) out._add_api_key = extraKey;
+  const key = ($('cfgKey') && $('cfgKey').value || '').trim();
+  if (key) out.api_keys = key; // 服务端把单值转成数组；面板登录与 /v1 共用
   return out;
 }
 // 数值字段即时校验：非空必须是有限数（保存被拒不如就地标红）。
@@ -995,6 +1027,13 @@ $('cfgForm').addEventListener('input', ev => {
   if (NUM_FIELDS.includes(ev.target.name)) markNumberFields();
 });
 $('btnCfgReload').onclick = loadConfig;
+// 显示/隐藏 API 密钥（参考面板同款交互）
+if ($('btnEye')) $('btnEye').onclick = () => {
+  const el = $('cfgKey');
+  const show = el.type === 'password';
+  el.type = show ? 'text' : 'password';
+  $('btnEye').textContent = show ? '隐藏' : '显示';
+};
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   markNumberFields();
@@ -1015,8 +1054,8 @@ $('cfgForm').onsubmit = async ev => {
     const r = await api('config', { method: 'POST', body: JSON.stringify(patch) });
     const fields = r.restart_required || [];
     toast(r.message || (fields.length ? '配置已保存，其中 ' + fields.length + ' 项需重启进程生效' : '配置已保存并立即生效'), 'ok');
-    const k = ($('cfgApiKey') && $('cfgApiKey').value || '').trim();
-    if (k) localStorage.setItem(LS_KEY, k); // 追加成功后用新密钥继续持有本机凭据
+    const k = ($('cfgKey') && $('cfgKey').value || '').trim();
+    if (k) localStorage.setItem(LS_KEY, k); // 改密钥后本机继续持有凭据，不必重登
     await loadConfig();
     $('cfgNote').textContent = fields.length ? '需重启生效：' + fields.join('、') : '';
     loadOverview(true);
@@ -1147,7 +1186,7 @@ $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
   b.disabled = true; b.title = '刷新中…';
   try {
-    await api('refresh_all', { method: 'POST' });
+    await api('balance_all', { method: 'POST' });
     await loadOverview(true);
     toast('额度已从上游刷新', 'ok');
   } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }

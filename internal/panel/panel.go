@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -79,7 +80,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
-	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.listAccounts))
 	p.mux.HandleFunc("POST /panel/api/accounts", p.withAuth(p.addAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/login", p.withAuth(p.loginAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/checkin", p.withAuth(p.checkinAccount))
@@ -87,15 +87,12 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/refresh", p.withAuth(p.refreshAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/pause", p.withAuth(p.pauseAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/resume", p.withAuth(p.resumeAccount))
-	p.mux.HandleFunc("POST /panel/api/accounts/{name}/enable", p.withAuth(p.enableAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/disable", p.withAuth(p.disableAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/revive", p.withAuth(p.reviveAccount))
 	p.mux.HandleFunc("POST /panel/api/accounts/{name}/remove", p.withAuth(p.removeAccount))
-	p.mux.HandleFunc("GET /panel/api/accounts/{name}/points", p.withAuth(p.accountPoints))
 
-	p.mux.HandleFunc("POST /panel/api/refresh_all", p.withAuth(p.refreshAll))
+	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.refreshAll))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
-	p.mux.HandleFunc("POST /panel/api/login_all", p.withAuth(p.loginAll))
 
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsHandler))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageHandler))
@@ -141,7 +138,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	ov["sticky_sessions"] = p.pool.Sticky().Snapshot()["entries"]
 	ov["uptime_sec"] = int(time.Since(p.started).Seconds())
 	ov["model_locks"] = p.pool.ModelLockView()
-	ov["accounts"] = p.accountRows24h()
+	ov["accounts"] = p.accountRows()
 
 	windows := map[string]int64{"24h": 86400, "today": todaySeconds(), "3d": 3 * 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 	sum := p.ledger.Summary(windows)
@@ -150,32 +147,32 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ov)
 }
 
-// accountRows24h 账号 Public 视图 + 台账 24h 观测（token/延迟/速率/最近成功）。
-func (p *Panel) accountRows24h() []map[string]any {
-	usage24 := p.ledger.Summary(map[string]int64{"24h": 86400})["24h"]
+// accountRows 账号行 + 台账统计。参考面板的「用量」是累计口径（不是某个窗口），
+// 所以这里取全历史窗口；「最近成功」也直接来自同一个桶，避免再多扫一遍台账。
+func (p *Panel) accountRows() []map[string]any {
+	all := p.ledger.Summary(map[string]int64{"all": 0})["all"]
 	rows := make([]map[string]any, 0, p.pool.Count())
 	for _, a := range p.pool.All() {
 		pub := a.Public()
-		if b := usage24.ByAccount[a.Name]; b != nil {
+		if b := all.ByAccount[a.Name]; b != nil {
+			tokens := b.Prompt + b.Completion
+			tps := float64(0)
+			if b.AvgLatencyMs > 0 {
+				tps = float64(tokens) / (float64(b.AvgLatencyMs) / 1000)
+			}
 			pub["token_usage"] = map[string]any{
-				"request_count":   b.Requests,
-				"total_tokens":    b.Prompt + b.Completion,
-				"last_latency_ms": b.AvgLatencyMs,
+				"request_count":          b.Requests,
+				"total_tokens":           tokens,
+				"last_latency_ms":        b.AvgLatencyMs,
+				"last_tokens_per_second": math.Round(tps*10) / 10,
 			}
 			pub["success_count"] = b.OK
 			pub["err_total"] = b.Fail
+			pub["last_success"] = b.LastOK
 		}
 		rows = append(rows, pub)
 	}
 	return rows
-}
-
-func (p *Panel) listAccounts(w http.ResponseWriter, r *http.Request) {
-	out := make([]map[string]any, 0, p.pool.Count())
-	for _, a := range p.pool.All() {
-		out = append(out, a.Public())
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "overview": p.pool.Overview()})
 }
 
 func (p *Panel) modelsHandler(w http.ResponseWriter, r *http.Request) {
@@ -272,11 +269,14 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求体必须是对象: "+err.Error())
 		return
 	}
-	// 追加网关密钥：面板读到的是脱敏列表，无法把原列表回传——用专用键交后端合并。
-	if add, _ := patch["_add_api_key"].(string); strings.TrimSpace(add) != "" {
-		delete(patch, "_add_api_key")
-		merged := append(append([]string{}, p.cfg.APIKeys...), strings.TrimSpace(add))
-		patch["api_keys"] = merged
+	// api_keys 与参考面板同款：面板拿到的是明文列表，改完整体回传即可。
+	if v, ok := patch["api_keys"].(string); ok {
+		// 单值输入框：空 = 不修改，非空 = 覆盖为这一把。
+		if s := strings.TrimSpace(v); s != "" {
+			patch["api_keys"] = []string{s}
+		} else {
+			delete(patch, "api_keys")
+		}
 	}
 	restart, err := p.cfg.Save(patch)
 	if err != nil {
@@ -497,27 +497,6 @@ func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
-func (p *Panel) accountPoints(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	acc := p.pool.Get(name)
-	if acc == nil {
-		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
-	obj, err := p.upstream.Points(ctx, acc.Session, 5)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, obj)
-}
-
-func (p *Panel) enableAccount(w http.ResponseWriter, r *http.Request) {
-	p.toggleAccount(w, r, true)
-}
-
 func (p *Panel) disableAccount(w http.ResponseWriter, r *http.Request) {
 	p.toggleAccount(w, r, false)
 }
@@ -600,58 +579,6 @@ func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 	p.Logf("全量刷新额度：%d 个账号", len(results))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
-}
-
-func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
-	accounts := p.pool.All()
-	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
-	defer cancel()
-	type result struct {
-		Name  string `json:"name"`
-		OK    bool   `json:"ok"`
-		Error string `json:"error,omitempty"`
-	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 2)
-	var mu sync.Mutex
-	var results []result
-
-	for _, a := range accounts {
-		if a.LoginID == "" || a.Password == "" {
-			continue
-		}
-		wg.Add(1)
-		go func(a *pool.Account) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			err := p.doLogin(a)
-			mu.Lock()
-			defer mu.Unlock()
-			res := result{Name: a.Name, OK: err == nil}
-			if err != nil {
-				res.Error = err.Error()
-			} else {
-				p.persist(a)
-				// 模拟真实客户端：登录成功后立刻领每日积分并刷额度。
-				if _, cerr := p.doCheckinCtx(ctx, a); cerr != nil {
-					p.Logf("账号 %s 登录后签到失败：%v", a.Name, cerr)
-				} else {
-					p.persist(a)
-				}
-			}
-			results = append(results, res)
-		}(a)
-	}
-	wg.Wait()
-	okCount := 0
-	for _, res := range results {
-		if res.OK {
-			okCount++
-		}
-	}
-	p.Logf("全量重新登录：成功 %d / %d", okCount, len(results))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 }
 
 // ------------------------------------------------------------------ 内部

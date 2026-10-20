@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/misakano7545/loomy2api-panel/internal/config"
 	"github.com/misakano7545/loomy2api-panel/internal/usage"
 )
 
@@ -290,17 +291,17 @@ func TestUsageHoursZeroAllHistory(t *testing.T) {
 	}
 }
 
-// TestSaveConfigAddAPIKey _add_api_key 合并进 api_keys（脱敏列表无法回传原文）。
-func TestSaveConfigAddAPIKey(t *testing.T) {
+// TestSaveConfigSetAPIKey 面板配置页是单个 API 密钥输入框（参考面板同款），
+// 保存时单值覆盖 api_keys 并落盘。
+func TestSaveConfigSetAPIKey(t *testing.T) {
 	pl, _ := newTestPanel(t)
-	// Save 写的是 Load 时的路径，测试里给它一个真实的 config.json。
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := configSaveSeed(pl.cfg, path); err != nil {
 		t.Fatal(err)
 	}
 	pl.cfg.APIKeys = []string{"sk-existing-0001"}
-	body := `{"_add_api_key":"sk-newkey123456"}`
-	req := httptest.NewRequest(http.MethodPost, "/panel/api/config", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/config",
+		strings.NewReader(`{"api_keys":"sk-newkey123456"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-existing-0001")
 	w := httptest.NewRecorder()
@@ -308,16 +309,14 @@ func TestSaveConfigAddAPIKey(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("状态码 %d body %s", w.Code, w.Body.String())
 	}
-	found := false
-	for _, k := range pl.cfg.APIKeys {
-		if k == "sk-newkey123456" {
-			found = true
-		}
+	if len(pl.cfg.APIKeys) != 1 || pl.cfg.APIKeys[0] != "sk-newkey123456" {
+		t.Errorf("api_keys 未被覆盖: %v", pl.cfg.APIKeys)
 	}
-	if !found {
-		t.Errorf("新密钥未合并进 api_keys: %v", pl.cfg.APIKeys)
+	reloaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("重新加载配置失败: %v", err)
 	}
-	if _, leaked := pl.cfg.Public()["_add_api_key"]; leaked {
-		t.Error("_add_api_key 不应残留在配置里")
+	if len(reloaded.APIKeys) != 1 || reloaded.APIKeys[0] != "sk-newkey123456" {
+		t.Errorf("磁盘上的 api_keys = %v", reloaded.APIKeys)
 	}
 }

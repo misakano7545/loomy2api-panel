@@ -461,19 +461,9 @@ func (c *Config) Public() map[string]any {
 	buf, _ := json.Marshal(c)
 	var m map[string]any
 	_ = json.Unmarshal(buf, &m)
-	if keys, ok := m["api_keys"].([]any); ok {
-		masked := make([]any, 0, len(keys))
-		for _, k := range keys {
-			s, _ := k.(string)
-			if len(s) > 6 {
-				s = s[:6] + "…（已设置）"
-			} else if s != "" {
-				s = "…（已设置）"
-			}
-			masked = append(masked, s)
-		}
-		m["api_keys"] = masked
-	}
+	// api_keys 明文下发（参考面板同款）：面板有「显示」按钮，且保存时整表回传。
+	// 看得见这把 key 的人本来就能用它打 /v1 与 /panel，脱敏只会让保存链路变形。
+	// access_key_secret 是 Loomy 账号服务签名密钥、参考面板没有对应项，仍然脱敏。
 	if sec, _ := m["access_key_secret"].(string); sec != "" {
 		m["access_key_secret"] = "…（已设置）"
 	}

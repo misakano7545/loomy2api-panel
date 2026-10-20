@@ -261,7 +261,7 @@ POST {base}/points/first-login          # body: {}
 |---|---|
 | `POST /panel/api/accounts/{name}/checkin` | 单号签到（幂等，已领过返回 already_processed=true） |
 | `POST /panel/api/checkin_all` | 全池签到（跳过禁用与登录态失效账号） |
-| 登录成功（login / login_all / 新增带密码账号） | 自动链式签到 + 刷额度 |
+| 登录成功（单号登录 / 新增带密码账号） | 自动链式签到 + 刷额度 |
 | 定时额度刷新（quota_refresh_minutes） | Quota 内部顺带调 first-login，跨日自动续领 |
 
 单测 `TestCheckinParsesRealSample` / `TestCheckinAccount` / `TestCheckinAll`

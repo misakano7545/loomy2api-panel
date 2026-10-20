@@ -164,6 +164,10 @@ type Bucket struct {
 	Completion   int64 `json:"completion_tokens"`
 	Points       int64 `json:"points"`
 	AvgLatencyMs int64 `json:"avg_latency_ms"`
+	// Last / LastOK 最近一次记录时间与最近一次成功时间（unix 秒）。面板账号行
+	// 「最近成功」直接用它，不必再单独扫一遍台账。
+	Last   int64 `json:"last"`
+	LastOK int64 `json:"last_ok"`
 }
 
 // Summary 按多个窗口汇总。
@@ -238,6 +242,12 @@ func aggregate(records []Record, from, to int64) *Window {
 			b.Completion += r.Completion
 			b.Points += r.Points
 			b.AvgLatencyMs += r.LatencyMs
+			if r.Time > b.Last {
+				b.Last = r.Time
+			}
+			if r.Status >= 200 && r.Status < 300 && r.Time > b.LastOK {
+				b.LastOK = r.Time
+			}
 		}
 		bump(w.ByModel, r.Model)
 		bump(w.ByAccount, r.Account)

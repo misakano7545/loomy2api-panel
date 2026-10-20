@@ -238,8 +238,9 @@ func TestSavePreservesUnknownKeys(t *testing.T) {
 	}
 }
 
-// TestPublicMasksSecrets 面板视图必须脱敏。
-func TestPublicMasksSecrets(t *testing.T) {
+// TestPublicKeepsAPIKeysMasksAccountSecret 面板视图口径（对齐参考面板）：
+// api_keys 明文下发（面板有「显示」按钮、保存要整表回传），access_key_secret 仍脱敏。
+func TestPublicKeepsAPIKeysMasksAccountSecret(t *testing.T) {
 	c := Defaults()
 	c.APIKeys = []string{"sk-abcdefghijklmnop"}
 	c.AccessKeySec = "very-secret"
@@ -249,14 +250,14 @@ func TestPublicMasksSecrets(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("api_keys 长度 %d", len(keys))
 	}
-	if strings.Contains(keys[0].(string), "abcdefghijklmnop") {
-		t.Errorf("api_key 未脱敏: %v", keys[0])
+	if keys[0].(string) != "sk-abcdefghijklmnop" {
+		t.Errorf("api_key 应明文下发，实际 %v", keys[0])
 	}
 	if sec := pub["access_key_secret"].(string); strings.Contains(sec, "very-secret") {
 		t.Errorf("access key secret 未脱敏: %v", sec)
 	}
 	if pub["api_keys_set"] != true {
-		t.Error("api_keys_set 应为 true")
+		t.Errorf("api_keys_set = %v", pub["api_keys_set"])
 	}
 }
 

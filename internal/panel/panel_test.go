@@ -219,7 +219,7 @@ func TestOverviewPayload(t *testing.T) {
 // TestListAccountsNoSecrets 账号列表绝不能回显密码或完整 session。
 func TestListAccountsNoSecrets(t *testing.T) {
 	pl, _ := newTestPanel(t)
-	req := httptest.NewRequest(http.MethodGet, "/panel/api/accounts", nil)
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
 	w := httptest.NewRecorder()
 	pl.ServeHTTP(w, req)
 
@@ -289,7 +289,9 @@ func TestAddAccountWithSession(t *testing.T) {
 }
 
 // TestDisableEnableAccount 启用/禁用开关。
-func TestDisableEnableAccount(t *testing.T) {
+// TestDisableThenRevive 参考面板的账号行只有「禁用」，重新放回池里走「解冻」
+// （revive 同时会置 enabled=true）——这里锁死这条恢复链路。
+func TestDisableThenRevive(t *testing.T) {
 	pl, p := newTestPanel(t)
 
 	req := httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/disable", nil)
@@ -299,11 +301,11 @@ func TestDisableEnableAccount(t *testing.T) {
 		t.Error("禁用未生效")
 	}
 
-	req = httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/enable", nil)
+	req = httptest.NewRequest(http.MethodPost, "/panel/api/accounts/acc1/revive", nil)
 	w = httptest.NewRecorder()
 	pl.ServeHTTP(w, req)
 	if !p.Get("acc1").Enabled {
-		t.Error("启用未生效")
+		t.Error("解冻应重新启用账号")
 	}
 }
 
@@ -352,7 +354,7 @@ func TestRemoveAccount(t *testing.T) {
 	}
 }
 
-// TestConfigGetAndSave 配置读写往返，密钥脱敏。
+// TestConfigGetAndSave 配置读写往返（api_keys 明文下发，与参考面板一致）。
 func TestConfigGetAndSave(t *testing.T) {
 	pl, _ := newTestPanel(t)
 	// 让 Save 有地方写（config.Save 写的是 Load 时的路径）
@@ -367,8 +369,9 @@ func TestConfigGetAndSave(t *testing.T) {
 	w := httptest.NewRecorder()
 	pl.ServeHTTP(w, req)
 	body := w.Body.String()
-	if strings.Contains(body, "sk-abcdefghij") {
-		t.Errorf("配置视图泄露了 api_key: %s", body)
+	// api_keys 明文下发：面板有「显示」按钮、保存要整表回传（参考面板同款）。
+	if !strings.Contains(body, "sk-abcdefghij") {
+		t.Errorf("配置视图应含明文 api_key: %s", body)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/panel/api/config",
