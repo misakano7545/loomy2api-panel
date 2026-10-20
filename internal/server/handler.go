@@ -996,7 +996,12 @@ func (h *Handler) resolveModel(payload map[string]any) string {
 	if h.Cfg.StripPrefix {
 		// 接受 "imodel/spark-x" 形态；上游本身也用 provider/model，
 		// 所以只在缺前缀时补，不强行剥掉。
-		if !strings.Contains(model, "/") {
+		//
+		// 但不能无脑补：上游 /models 现在给的是裸 id（spark-x、DeepSeek-V4.1-Flash），
+		// 我们对外的 /v1/models 原样透出这些 id；如果这里再补 imodel/，上游认不出
+		// 就会**静默回落到默认模型**（客户端以为在用 spark-x，实际扣的是 DeepSeek 的
+		// 积分，且响应里 model 字段会变）。所以已知的裸 id 一律不补前缀。
+		if !strings.Contains(model, "/") && !h.knownModel(model) {
 			model = "imodel/" + model
 		}
 	}
@@ -1004,6 +1009,20 @@ func (h *Handler) resolveModel(payload map[string]any) string {
 		payload["model"] = model
 	}
 	return model
+}
+
+// knownModel 判断裸 id 是否就是上游目录里的模型（命中则不补 imodel/ 前缀）。
+// 缓存未命中（还没查过 /models）时返回 false，退回旧的补前缀行为。
+func (h *Handler) knownModel(id string) bool {
+	if h.Models == nil {
+		return false
+	}
+	for _, m := range h.Models.Get(context.Background(), "") {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) record(r usage.Record) {

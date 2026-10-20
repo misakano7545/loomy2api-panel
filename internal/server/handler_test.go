@@ -708,3 +708,52 @@ func TestNoAccountFailureReachesLedger(t *testing.T) {
 		t.Fatalf("没号可用的失败没进台账: %+v", recs)
 	}
 }
+
+// TestKnownModelKeepsBareID 回归：/v1/models 透出的是上游裸 id（spark-x），
+// 客户端拿这些 id 回来时必须原样转发。若错误地补成 imodel/spark-x，上游无法识别
+// 会静默回落到默认模型——实测 spark-x 被 DeepSeek 执行并扣了积分。
+func TestKnownModelKeepsBareID(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"spark-x","name":"Spark-X2.5（限时免费）(x0.0)","type":"chat"},
+				{"id":"DeepSeek-V4.1-Flash","name":"DeepSeek V4.1 Flash(x2.0)","type":"chat"}
+			]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	// 预热目录（真实场景由客户端先调 /v1/models 或启动预热完成）。
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 2 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"spark-x","messages":[{"role":"user","content":"hi"}],"max_tokens":10}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	var found bool
+	for _, b := range fs.bodies {
+		if strings.Contains(b, `"model":"spark-x"`) {
+			found = true
+		}
+		if strings.Contains(b, `"model":"imodel/spark-x"`) {
+			t.Fatalf("已知裸 id 不该补前缀: %s", b)
+		}
+	}
+	if !found {
+		t.Fatalf("上游没收到裸 id：%v", fs.bodies)
+	}
+
+	// 目录里没有的名字仍走旧的补前缀行为（兼容 imodel/xxx 客户端）。
+	fresh := newFakeUpstream(t, jsonHandler(200, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}`))
+	h2, _, _ := newTestHandler(t, fresh.srv.URL, nil)
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"legacy-model","messages":[{"role":"user","content":"hi"}],"max_tokens":5}`))
+	h2.Routes().ServeHTTP(httptest.NewRecorder(), req2)
+	if !strings.Contains(fresh.bodies[0], `"model":"imodel/legacy-model"`) {
+		t.Errorf("未知名字应补前缀：%s", fresh.bodies[0])
+	}
+}

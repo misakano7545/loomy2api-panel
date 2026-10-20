@@ -452,9 +452,6 @@ async function loadOverview(quiet) {
     $('sSticky').textContent = d.sticky_sessions == null ? '-' : d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
-    // 上游只显示主机名：完整 URL 会把侧栏底部挤成两三行（截图实测）。
-    $('navUp').textContent = String(d.upstream || '').replace(/^https?:\/\//, '').split('/')[0];
-    $('navUp').title = d.upstream || '';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
