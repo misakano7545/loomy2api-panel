@@ -29,7 +29,7 @@ var (
 	}
 	reSessionWords = []string{
 		"session not found", "session 失效", "session invalid", "unauthorized",
-		"invalid token", "登录已过期", "登录态", "token expired", "401",
+		"invalid token", "登录已过期", "登录已失效", "登录失效", "登录态", "token expired", "401", "100002",
 	}
 	reRateWords = []string{
 		"rate limit", "too many requests", "frequency", "限流", "请求过于频繁", "qps",

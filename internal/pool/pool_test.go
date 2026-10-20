@@ -572,3 +572,12 @@ func TestPoolAddReplacesCredentialPreservingCounters(t *testing.T) {
 		t.Errorf("计数应保留 7，实际 %d", got.Requests)
 	}
 }
+
+// TestClassifySessionBodyOnly 上游给 200+错误信封（已改判 502）时，文案里的
+// 「登录已失效」仍要判成 FaultSession，才能触发重登而不是当服务器故障。
+func TestClassifySessionBodyOnly(t *testing.T) {
+	body := `{"code":"100002","desc":"登录已失效，请重新登录","data":{}}`
+	if got := Classify(502, body); got != FaultSession {
+		t.Errorf("登录已失效应为 FaultSession，实际 %v", got)
+	}
+}

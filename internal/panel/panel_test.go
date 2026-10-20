@@ -2,8 +2,11 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -99,7 +102,7 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
-// TestAppScriptServed app.js 与 style.css 可访问且 MIME 正确。
+// TestAppScriptServed app.js 与 theme.js 可访问且 MIME 正确。
 func TestAppScriptServed(t *testing.T) {
 	pl, _ := newTestPanel(t)
 
@@ -116,14 +119,14 @@ func TestAppScriptServed(t *testing.T) {
 		t.Errorf("app.js 内容过短: %d 字节", len(w.Body.Bytes()))
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/panel/style.css", nil)
+	req = httptest.NewRequest(http.MethodGet, "/panel/theme.js", nil)
 	w = httptest.NewRecorder()
 	pl.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
-		t.Fatalf("style.css 状态码 %d", w.Code)
+		t.Fatalf("theme.js 状态码 %d", w.Code)
 	}
-	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "css") {
-		t.Errorf("style.css Content-Type = %q", ct)
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("theme.js Content-Type = %q", ct)
 	}
 }
 
@@ -393,7 +396,11 @@ func configSaveSeed(cfg *config.Config, path string) error {
 // TestLogsEndpoint 日志接口返回数组。
 func TestLogsEndpoint(t *testing.T) {
 	pl, _ := newTestPanel(t)
-	pl.Logf("测试一行")
+	// 与 main 同款接线：log 包输出镜像进面板环（Logf 只写 log，不重复入环）
+	log.SetOutput(io.MultiWriter(os.Stderr, pl.LogWriter()))
+	defer log.SetOutput(os.Stderr)
+	pl.Logf("账号 acc1 已解冻（冷却与熔断清零）")
+	pl.Logf("| #001 | 20:00:00 | glm |  10 | acc | 100ms | ok |") // 请求表格行 → chat
 
 	req := httptest.NewRequest(http.MethodGet, "/panel/api/logs", nil)
 	w := httptest.NewRecorder()
@@ -403,9 +410,21 @@ func TestLogsEndpoint(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatalf("不是 JSON: %v", err)
 	}
-	lines, _ := out["lines"].([]any)
-	if len(lines) == 0 {
-		t.Error("日志为空")
+	entries, _ := out["entries"].([]any)
+	if len(entries) == 0 {
+		t.Fatal("日志为空")
+	}
+	first, _ := entries[0].(map[string]any)
+	if !strings.HasPrefix(first["text"].(string), "账号 acc1") {
+		t.Errorf("text = %v", first["text"])
+	}
+	// 频道归类：面板动作行 → task，请求表格行 `| #` → chat
+	if first["ch"] != ChTask {
+		t.Errorf("频道 = %v，期望 %s", first["ch"], ChTask)
+	}
+	last, _ := entries[len(entries)-1].(map[string]any)
+	if last["ch"] != ChChat {
+		t.Errorf("请求行频道 = %v，期望 %s", last["ch"], ChChat)
 	}
 }
 

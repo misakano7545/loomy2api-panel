@@ -406,3 +406,93 @@ func TestFallbackModels(t *testing.T) {
 		t.Error("应返回副本而非内部切片")
 	}
 }
+
+// TestSaveRejectsBadTypeWithoutTouchingFile 类型不对的 patch 必须整体拒绝，
+// 且不能把文件写坏（曾出现写坏后连重启都起不来）。
+func TestSaveRejectsBadTypeWithoutTouchingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	orig := []byte(`{"listen":":1111","pick_top_n":3}`)
+	if err := os.WriteFile(path, orig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Save(map[string]any{"pick_top_n": "abc"}); err == nil {
+		t.Fatal("类型不对的 patch 应报错")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(orig) {
+		t.Errorf("文件被改动: %s", raw)
+	}
+	if _, err := Load(path); err != nil {
+		t.Errorf("文件应仍可加载: %v", err)
+	}
+}
+
+// TestValidateRejectsBadValues 非法 strategy / listen 必须在加载与保存时都拦住，
+// 不能静默退回 weighted 或等重启才炸。
+func TestValidateRejectsBadValues(t *testing.T) {
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"strategy":"weight"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(bad); err == nil {
+		t.Error("非法 strategy 应在加载时报错")
+	}
+
+	ok := filepath.Join(dir, "ok.json")
+	if err := os.WriteFile(ok, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Save(map[string]any{"strategy": "weight"}); err == nil {
+		t.Error("非法 strategy 应在保存时报错")
+	}
+	if _, err := cfg.Save(map[string]any{"listen": "17890"}); err == nil {
+		t.Error("非法 listen 应在保存时报错")
+	}
+	if _, err := cfg.Save(map[string]any{"strategy": "round_robin", "listen": "127.0.0.1:18080"}); err != nil {
+		t.Errorf("合法值不该报错: %v", err)
+	}
+}
+
+// TestSaveOnlyReportsChangedRestartKeys 面板保存会整表提交，值没变的重启键
+// 不能报成「需重启」，否则每次保存都在说谎。
+func TestSaveOnlyReportsChangedRestartKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"listen":":1111","upstream":"https://a.example/api","pick_top_n":3}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 整表提交：重启键原样带回 + 一个热生效键改动
+	restart, err := cfg.Save(map[string]any{
+		"listen": ":1111", "upstream": "https://a.example/api", "pick_top_n": 9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restart) != 0 {
+		t.Errorf("值未变的重启键不该上报: %v", restart)
+	}
+	restart, err = cfg.Save(map[string]any{"listen": ":2222", "upstream": "https://a.example/api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restart) != 1 || restart[0] != "listen" {
+		t.Errorf("真改了的 listen 应上报，实际 %v", restart)
+	}
+}

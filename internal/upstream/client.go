@@ -7,6 +7,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -126,7 +127,44 @@ func (c *Client) Do(ctx context.Context, method, suffix, session string, payload
 	if err != nil {
 		return nil, err
 	}
+	// 上游把业务错误（如登录态失效）塞进 200 的 body 里，状态码仍是 200。
+	// 流式响应不能预读，其余预读整包后按错误信封改判状态码，交给调用方的
+	// 状态码分类逻辑处理，避免错误被当成成功放行。
+	if resp.StatusCode == http.StatusOK && !strings.Contains(resp.Header.Get("Content-Type"), "event-stream") {
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		status := resp.StatusCode
+		if errEnvelope(raw) {
+			status = http.StatusBadGateway
+		}
+		return &Response{Status: status, Header: resp.Header, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+	}
 	return &Response{Status: resp.StatusCode, Header: resp.Header, Body: resp.Body}, nil
+}
+
+const maxBodyBytes = 32 << 20
+
+// errEnvelope 判定「HTTP 200 + 业务错误」响应：顶层有非零 code、且没有正常
+// 响应的数据键（choices/output/object）。错误信封自己也带 data:{}，故不排除 data。
+func errEnvelope(raw []byte) bool {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return false
+	}
+	for _, k := range []string{"choices", "output", "object"} {
+		if _, ok := obj[k]; ok {
+			return false
+		}
+	}
+	code, ok := obj["code"]
+	if !ok {
+		return false
+	}
+	s := strings.TrimSpace(fmt.Sprint(code))
+	return s != "" && s != "0" && s != "200"
 }
 
 // GetJSON 便捷：GET 并解析 JSON。
@@ -220,8 +258,9 @@ func (c *Client) Models(ctx context.Context, session string) ([]config.Model, er
 
 // Quota 查询积分余额。上游只认 camelCase 的 pageSize（下划线会被静默忽略）。
 func (c *Client) Quota(ctx context.Context, session string) (balance, daily, available *int64, err error) {
+	// 该端点上游只挂 GET，POST 会直接 404（额度刷新曾因此永久失败）。
 	suffix := "points/records?record_type=all&pageNo=1&pageSize=1"
-	obj, status, err := c.PostJSON(ctx, suffix, session, nil, nil)
+	obj, status, err := c.GetJSON(ctx, suffix, session)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -264,7 +303,7 @@ func (c *Client) Points(ctx context.Context, session string, pages int) (map[str
 	var debits, credits int64
 	for p := 1; p <= pages; p++ {
 		suffix := fmt.Sprintf("points/records?record_type=all&pageNo=%d&pageSize=100", p)
-		obj, status, err := c.PostJSON(ctx, suffix, session, nil, nil)
+		obj, status, err := c.GetJSON(ctx, suffix, session)
 		if err != nil {
 			return nil, err
 		}

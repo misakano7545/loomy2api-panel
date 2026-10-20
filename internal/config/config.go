@@ -12,8 +12,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 )
@@ -185,7 +187,24 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyEnv()
 	cfg.normalize()
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", abs, err)
+	}
 	return cfg, nil
+}
+
+// validate 拒绝会静默跑偏的取值：非法 strategy 以前只在选号时悄悄退回
+// weighted，非法 listen 要等重启才炸。
+func (c *Config) validate() error {
+	switch strings.ToLower(c.Strategy) {
+	case "weighted", "round_robin", "balance", "lru":
+	default:
+		return fmt.Errorf("strategy %q 无效（weighted / round_robin / balance / lru）", c.Strategy)
+	}
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("listen %q 无效（形如 :17890）: %w", c.Listen, err)
+	}
+	return nil
 }
 
 // mergeJSON 把磁盘上的键逐个写进结构体（跳过 _ 开头的注释键）。
@@ -364,6 +383,11 @@ func (c *Config) Save(patch map[string]any) ([]string, error) {
 	if current == nil {
 		current = map[string]any{}
 	}
+	// 合并前的快照：后面判断「重启键是否真的变了」要用它（current 会被 patch 覆盖）。
+	before := make(map[string]any, len(current))
+	for k, v := range current {
+		before[k] = v
+	}
 	for k, v := range patch {
 		if strings.HasPrefix(k, "_") {
 			continue
@@ -372,6 +396,18 @@ func (c *Config) Save(patch map[string]any) ([]string, error) {
 	}
 	buf, err := json.MarshalIndent(current, "", "  ")
 	if err != nil {
+		return nil, err
+	}
+	// 先按 Config 结构校验，再落盘：类型不对的 patch 曾经写进文件后才发现，
+	// 结果配置被写坏、进程重启直接起不来。
+	merged := map[string]any{}
+	_ = json.Unmarshal(buf, &merged)
+	fresh := Defaults()
+	fresh.path = c.path
+	if err := mergeJSON(fresh, merged); err != nil {
+		return nil, err
+	}
+	if err := fresh.validate(); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
@@ -386,21 +422,21 @@ func (c *Config) Save(patch map[string]any) ([]string, error) {
 	}
 
 	// 就地更新内存配置（热生效字段立即生效）。
-	merged := map[string]any{}
-	_ = json.Unmarshal(buf, &merged)
-	fresh := Defaults()
-	fresh.path = c.path
-	if err := mergeJSON(fresh, merged); err != nil {
-		return nil, err
-	}
 	fresh.applyEnv()
 	fresh.normalize()
 
+	// 只报真正变了的键：面板保存会整表提交，按「提交了就报」会让每次保存都
+	// 声称 listen/upstream 要重启，用户无从判断。
 	restart := []string{}
 	for _, k := range restartKeys {
-		if _, ok := patch[k]; ok {
-			restart = append(restart, k)
+		v, ok := patch[k]
+		if !ok {
+			continue
 		}
+		if old, had := before[k]; had && reflect.DeepEqual(old, v) {
+			continue
+		}
+		restart = append(restart, k)
 	}
 
 	// 保留互斥锁指针，其余整体替换。

@@ -296,3 +296,46 @@ func TestGetJSON(t *testing.T) {
 		t.Errorf("响应不对: %d %v", status, obj)
 	}
 }
+
+// TestDoRewritesBusinessError 上游把错误塞在 200 的 body 里时，状态要改判成 5xx，
+// 否则错误会被当成成功放行、坏账号永远不进冷却。
+func TestDoRewritesBusinessError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":"100002","desc":"登录已失效，请重新登录","data":{}}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	resp, err := c.Do(context.Background(), http.MethodPost, "chat/completions", "s", map[string]any{}, nil)
+	if err != nil {
+		t.Fatalf("Do 失败: %v", err)
+	}
+	if resp.Status != http.StatusBadGateway {
+		t.Errorf("业务错误应改判 502，实际 %d", resp.Status)
+	}
+	if body := resp.BodyText(); !strings.Contains(body, "100002") {
+		t.Errorf("body 应保留原文，实际 %q", body)
+	}
+}
+
+// TestDoKeepsNormalJSON 正常 JSON 与 SSE 不受改判逻辑影响。
+func TestDoKeepsNormalJSON(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"object":"list","data":[]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "1.0.0", "", 5*time.Second)
+	resp, err := c.Do(context.Background(), http.MethodGet, "models", "s", nil, nil)
+	if err != nil {
+		t.Fatalf("Do 失败: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Errorf("正常响应不该改判，实际 %d", resp.Status)
+	}
+	if body := resp.BodyText(); !strings.Contains(body, `"object":"list"`) {
+		t.Errorf("body 被改动: %q", body)
+	}
+}

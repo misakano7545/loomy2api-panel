@@ -658,3 +658,53 @@ func TestUnknownPath404(t *testing.T) {
 }
 
 var _ = context.Background
+
+// TestFailuresReachLedger 失败请求必须进台账，否则「请求记录」页只有成功，
+// 「失败」筛选永远空。
+func TestFailuresReachLedger(t *testing.T) {
+	fs := newFakeUpstream(t, jsonHandler(429, `{"error":"rate limit"}`))
+	h, _, ledger := newTestHandler(t, fs.srv.URL, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code == http.StatusOK {
+		t.Fatalf("上游 429 时不该回 200，实际 %d", w.Code)
+	}
+	recs := ledger.Recent(10, usage.RecordFilter{})
+	if len(recs) == 0 {
+		t.Fatal("失败请求没有进台账")
+	}
+	r := recs[0]
+	if r.Status != http.StatusTooManyRequests {
+		t.Errorf("台账状态 %d，期望 429", r.Status)
+	}
+	if r.Kind != "chat" || !strings.HasSuffix(r.Model, "/m") {
+		t.Errorf("台账 kind/model 不对: %q %q", r.Kind, r.Model)
+	}
+	if r.Error == "" {
+		t.Error("失败记录应带上游错误原文")
+	}
+}
+
+// TestNoAccountFailureReachesLedger 没号可用也要进台账。
+func TestNoAccountFailureReachesLedger(t *testing.T) {
+	fs := newFakeUpstream(t, jsonHandler(200, `{"choices":[]}`))
+	h, p, ledger := newTestHandler(t, fs.srv.URL, nil)
+	p.Remove("acc")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 %d，期望 503", w.Code)
+	}
+	recs := ledger.Recent(10, usage.RecordFilter{})
+	if len(recs) == 0 || recs[0].Status != http.StatusServiceUnavailable {
+		t.Fatalf("没号可用的失败没进台账: %+v", recs)
+	}
+}

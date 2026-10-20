@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -87,6 +88,9 @@ func main() {
 
 	// ---- 面板 ----
 	pl := panel.New(cfg, p, accClient, up, ledger, h.Models, appVersion)
+	// log 包输出镜像进面板日志环：请求表格行（`| #001 |…`）按 chat 频道归类，
+	// 面板「运行日志」因此能看到对话流水而不只是面板自己的动作。
+	log.SetOutput(io.MultiWriter(os.Stderr, pl.LogWriter()))
 
 	mux := http.NewServeMux()
 	mux.Handle("/panel/", pl)

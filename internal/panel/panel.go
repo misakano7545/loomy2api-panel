@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -36,8 +37,7 @@ type Panel struct {
 
 	mux *http.ServeMux
 
-	logMu   sync.Mutex
-	logRing []string
+	ring *Ring
 
 	version string
 
@@ -53,29 +53,27 @@ func New(cfg *config.Config, p *pool.Pool, acc *account.Client, up *upstream.Cli
 		cfg: cfg, pool: p, accounts: acc, upstream: up,
 		ledger: ledger, models: models, version: version,
 		mux:   http.NewServeMux(),
+		ring:  NewRing(500),
 		locks: map[string]*sync.Mutex{},
 	}
 	pl.routes()
 	return pl
 }
 
-// Logf 记录一行面板日志（面板「运行日志」页展示）。
+// LogWriter 暴露环的 io.Writer：main 用 log.SetOutput(io.MultiWriter(os.Stderr, pl.LogWriter()))
+// 把 log 包输出（含网关请求表格行）镜像进面板「运行日志」。
+func (p *Panel) LogWriter() io.Writer { return p.ring }
+
+// Logf 记录一行面板日志。只写 log，环由 main 装的 MultiWriter 收——
+// 两边都写会让每条日志在「运行日志」里出现两次。
 func (p *Panel) Logf(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	line := time.Now().Format("15:04:05 ") + msg
-	log.Print(msg)
-	p.logMu.Lock()
-	p.logRing = append(p.logRing, line)
-	if len(p.logRing) > 500 {
-		p.logRing = p.logRing[len(p.logRing)-500:]
-	}
-	p.logMu.Unlock()
+	log.Print(fmt.Sprintf(format, args...))
 }
 
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
-	p.mux.HandleFunc("GET /panel/style.css", p.styleSheet)
+	p.mux.HandleFunc("GET /panel/theme.js", p.themeScript)
 
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/accounts", p.withAuth(p.listAccounts))
@@ -94,6 +92,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsHandler))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageHandler))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummaryHandler))
 	p.mux.HandleFunc("GET /panel/api/requests", p.withAuth(p.requests))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -114,9 +113,7 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			keys = []string{p.cfg.PanelPass}
 		}
 		if !httpauth.Verify(r, keys) {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusUnauthorized)
-			writeJSON(w, map[string]any{"error": "invalid key"})
+			writeErr(w, http.StatusUnauthorized, "invalid key")
 			return
 		}
 		next(w, r)
@@ -138,7 +135,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	sum := p.ledger.Summary(windows)
 	ov["usage"] = sum
 	ov["hourly"] = p.ledger.Hourly(24)
-	writeJSON(w, ov)
+	writeJSON(w, http.StatusOK, ov)
 }
 
 func (p *Panel) listAccounts(w http.ResponseWriter, r *http.Request) {
@@ -146,12 +143,12 @@ func (p *Panel) listAccounts(w http.ResponseWriter, r *http.Request) {
 	for _, a := range p.pool.All() {
 		out = append(out, a.Public())
 	}
-	writeJSON(w, map[string]any{"accounts": out, "overview": p.pool.Overview()})
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "overview": p.pool.Overview()})
 }
 
 func (p *Panel) modelsHandler(w http.ResponseWriter, r *http.Request) {
 	list := p.models.Get(r.Context(), p.anySession())
-	writeJSON(w, map[string]any{"models": list})
+	writeJSON(w, http.StatusOK, map[string]any{"models": list})
 }
 
 func (p *Panel) usageHandler(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +166,7 @@ func (p *Panel) usageHandler(w http.ResponseWriter, r *http.Request) {
 			hours = n
 		}
 	}
-	writeJSON(w, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"window": win,
 		"hourly": p.ledger.Hourly(hours),
 		"models": p.ledger.Models(),
@@ -192,19 +189,25 @@ func (p *Panel) requests(w http.ResponseWriter, r *http.Request) {
 		Model:   q.Get("model"),
 		Account: q.Get("account"),
 	}
-	writeJSON(w, map[string]any{"records": p.ledger.Recent(limit, filter)})
+	writeJSON(w, http.StatusOK, map[string]any{"records": p.ledger.Recent(limit, filter)})
 }
 
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
-	p.logMu.Lock()
-	lines := make([]string, len(p.logRing))
-	copy(lines, p.logRing)
-	p.logMu.Unlock()
-	writeJSON(w, map[string]any{"lines": lines})
+	writeJSON(w, http.StatusOK, map[string]any{"entries": p.ring.Snapshot()})
+}
+
+// errorSummaryHandler GET /panel/api/error_summary（默认窗口 24h）。
+func (p *Panel) errorSummaryHandler(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	from, _ := parseRange(q.Get("from"), q.Get("to"))
+	if from == 0 {
+		from = time.Now().Unix() - 86400
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"errors": p.errorSummary(from)})
 }
 
 func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"config": p.cfg.Public(),
 		"path":   p.cfg.Path(),
 	})
@@ -213,18 +216,18 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 	var patch map[string]any
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		writeJSON(w, map[string]any{"error": "请求体必须是对象: " + err.Error()})
+		writeErr(w, http.StatusBadRequest, "请求体必须是对象: "+err.Error())
 		return
 	}
 	restart, err := p.cfg.Save(patch)
 	if err != nil {
-		writeJSON(w, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	// 池参数热生效
 	p.pool.SetOptions(poolOptions(p.cfg))
 	p.Logf("配置已保存（%d 项）", len(patch))
-	writeJSON(w, map[string]any{
+	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "restart_required": restart,
 		"message": restartMsg(restart),
 	})
@@ -242,7 +245,7 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 		Login    bool   `json:"login"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, map[string]any{"error": "请求体解析失败: " + err.Error()})
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
 		return
 	}
 	body.LoginID = strings.TrimSpace(body.LoginID)
@@ -251,11 +254,11 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 		body.Name = body.LoginID
 	}
 	if body.Name == "" {
-		writeJSON(w, map[string]any{"error": "name / loginid 至少填一个"})
+		writeErr(w, http.StatusBadRequest, "name / loginid 至少填一个")
 		return
 	}
 	if body.LoginID == "" && body.Session == "" {
-		writeJSON(w, map[string]any{"error": "需要 loginid + password，或直接给 session"})
+		writeErr(w, http.StatusBadRequest, "需要 loginid + password，或直接给 session")
 		return
 	}
 
@@ -279,25 +282,25 @@ func (p *Panel) addAccount(w http.ResponseWriter, r *http.Request) {
 		if err := p.doLogin(acc); err != nil {
 			p.Logf("账号 %s 加入，但登录失败：%v", acc.Name, err)
 			p.persist(acc)
-			writeJSON(w, map[string]any{"ok": false, "error": "账号已加入，但登录失败: " + err.Error()})
+			writeErr(w, http.StatusBadGateway, "账号已加入，但登录失败: "+err.Error())
 			return
 		}
 	}
 	p.persist(acc)
 	p.Logf("新增账号 %s（登录态 %v）", acc.Name, acc.SessionValid())
 	go p.refreshQuota(acc)
-	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
 func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	if !p.tryLock(name) {
-		writeJSON(w, map[string]any{"error": "该账号正在执行其它运维动作"})
+		writeErr(w, http.StatusConflict, "该账号正在执行其它运维动作")
 		return
 	}
 	defer p.unlock(name)
@@ -306,7 +309,7 @@ func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
 		acc.SetLastError("登录失败: " + err.Error())
 		p.Logf("账号 %s 登录失败：%v", name, err)
 		p.persist(acc)
-		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	acc.Enabled = true
@@ -314,41 +317,41 @@ func (p *Panel) loginAccount(w http.ResponseWriter, r *http.Request) {
 	p.persist(acc)
 	p.Logf("账号 %s 登录成功（14 天有效）", name)
 	go p.refreshQuota(acc)
-	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
 func (p *Panel) refreshAccount(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	if err := p.refreshQuotaCtx(ctx, acc); err != nil {
-		writeJSON(w, map[string]any{"ok": false, "error": err.Error()})
+		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	p.persist(acc)
-	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
 func (p *Panel) accountPoints(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	obj, err := p.upstream.Points(ctx, acc.Session, 5)
 	if err != nil {
-		writeJSON(w, map[string]any{"error": err.Error()})
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, obj)
+	writeJSON(w, http.StatusOK, obj)
 }
 
 func (p *Panel) enableAccount(w http.ResponseWriter, r *http.Request) {
@@ -363,7 +366,7 @@ func (p *Panel) toggleAccount(w http.ResponseWriter, r *http.Request, enabled bo
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	acc.Enabled = enabled
@@ -373,14 +376,14 @@ func (p *Panel) toggleAccount(w http.ResponseWriter, r *http.Request, enabled bo
 	} else {
 		p.Logf("账号 %s 已禁用（不参与选号，定时任务仍可手动跑）", name)
 	}
-	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
 func (p *Panel) reviveAccount(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	acc.ResetCooldowns()
@@ -388,14 +391,14 @@ func (p *Panel) reviveAccount(w http.ResponseWriter, r *http.Request) {
 	acc.SetLastError("")
 	p.persist(acc)
 	p.Logf("账号 %s 已解冻（冷却与熔断清零）", name)
-	writeJSON(w, map[string]any{"ok": true, "account": acc.Public()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc.Public()})
 }
 
 func (p *Panel) removeAccount(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	acc := p.pool.Get(name)
 	if acc == nil {
-		writeJSON(w, map[string]any{"error": "账号不存在: " + name})
+		writeErr(w, http.StatusNotFound, "账号不存在: "+name)
 		return
 	}
 	p.pool.Remove(name)
@@ -403,7 +406,7 @@ func (p *Panel) removeAccount(w http.ResponseWriter, r *http.Request) {
 		p.Logf("账号 %s 已移出池，但删除凭证文件失败：%v", name, err)
 	}
 	p.Logf("账号 %s 已移除", name)
-	writeJSON(w, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
@@ -436,7 +439,7 @@ func (p *Panel) refreshAll(w http.ResponseWriter, r *http.Request) {
 	}
 	wg.Wait()
 	p.Logf("全量刷新额度：%d 个账号", len(results))
-	writeJSON(w, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results, "overview": p.pool.Overview()})
 }
 
 func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
@@ -480,7 +483,7 @@ func (p *Panel) loginAll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	p.Logf("全量重新登录：成功 %d / %d", okCount, len(results))
-	writeJSON(w, map[string]any{"ok": true, "results": results})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
 }
 
 // ------------------------------------------------------------------ 内部
@@ -632,9 +635,16 @@ func restartMsg(keys []string) string {
 	return "已保存；以下字段需重启进程生效: " + strings.Join(keys, ", ")
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(v)
+}
+
+// writeErr 与蓝本同款错误信封：业务错误一律带真实 HTTP 状态，
+// 前端 api() 靠 res.ok 判成败，不必再读 body 里的 error 字段。
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }

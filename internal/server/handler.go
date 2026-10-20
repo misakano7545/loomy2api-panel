@@ -317,6 +317,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[string]any, model, skey string, extra map[string]string) {
 	started := time.Now()
 	var tried []string
+	var lastAcc *pool.Account
 	var lastStatus int
 	var lastBody string
 
@@ -324,12 +325,13 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 		acc, err := h.Pool.Acquire(tried, model, skey)
 		if err != nil {
 			if len(tried) == 0 {
-				writeErr(w, http.StatusServiceUnavailable, err.Error(), "upstream_error")
+				h.fail(w, r, "chat", model, nil, http.StatusServiceUnavailable, err.Error(), started)
 				return
 			}
 			break
 		}
 		tried = append(tried, acc.Name)
+		lastAcc = acc
 		opts := h.Pool.Options()
 		resp, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", acc.Session, req, extra)
 		if err != nil {
@@ -382,7 +384,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 	if lastBody == "" {
 		lastBody = "所有账号都失败了"
 	}
-	h.writeUpstreamError(w, lastStatus, lastBody)
+	h.fail(w, r, "chat", model, lastAcc, lastStatus, lastBody, started)
 }
 
 // chatAggregated 非流式长任务：内部走流式取数再聚合。
@@ -427,6 +429,7 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 
 	obj, err := h.collectStream(r.Context(), sreq, model, skey, extra)
 	if err != nil {
+		h.noteFail(r, "chat", model, nil, http.StatusBadGateway, err.Error(), started)
 		writeJSON(w, map[string]any{"error": map[string]any{
 			"message": err.Error(), "type": "upstream_error", "code": 502,
 		}})
@@ -520,12 +523,13 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		acc, err := h.Pool.Acquire(tried, model, skey)
 		if err != nil {
 			if len(tried) == 0 {
-				writeErr(w, http.StatusServiceUnavailable, err.Error(), "upstream_error")
+				h.fail(w, r, "chat", model, nil, http.StatusServiceUnavailable, err.Error(), started)
 				return
 			}
 			break
 		}
 		tried = append(tried, acc.Name)
+		lastAcc = acc
 		resp, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", acc.Session, req, extra)
 		if err != nil {
 			h.Pool.Release(acc)
@@ -550,7 +554,7 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		if lastStatus == 0 {
 			lastStatus = http.StatusBadGateway
 		}
-		h.writeUpstreamError(w, lastStatus, lastBody)
+		h.fail(w, r, "chat", model, lastAcc, lastStatus, lastBody, started)
 		return
 	}
 	defer h.Pool.Release(lastAcc)
@@ -630,13 +634,14 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	skey := pool.SessionKey(chatReq)
 	extra := headerExtras(r, req)
 
+	started := time.Now()
 	if truthy(req["stream"]) {
 		h.responsesStream(w, r, chatReq, model, skey, extra)
 		return
 	}
 	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error(), "upstream_error")
+		h.fail(w, r, "responses", model, nil, http.StatusBadGateway, err.Error(), started)
 		return
 	}
 	writeJSON(w, bridge.ChatToResponse(obj, model))
@@ -657,12 +662,13 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		a, err := h.Pool.Acquire(tried, model, skey)
 		if err != nil {
 			if len(tried) == 0 {
-				writeErr(w, http.StatusServiceUnavailable, err.Error(), "upstream_error")
+				h.fail(w, r, "responses", model, nil, http.StatusServiceUnavailable, err.Error(), started)
 				return
 			}
 			break
 		}
 		tried = append(tried, a.Name)
+		acc = a
 		rs, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", a.Session, sreq, extra)
 		if err != nil {
 			h.Pool.Release(a)
@@ -686,7 +692,7 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		if lastStatus == 0 {
 			lastStatus = http.StatusBadGateway
 		}
-		h.writeUpstreamError(w, lastStatus, lastBody)
+		h.fail(w, r, "responses", model, acc, lastStatus, lastBody, started)
 		return
 	}
 	defer h.Pool.Release(acc)
@@ -756,12 +762,14 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	skey := pool.SessionKey(chatReq)
 	extra := headerExtras(r, req)
 
+	started := time.Now()
 	if truthy(req["stream"]) {
 		h.anthropicStream(w, r, chatReq, model, skey, extra)
 		return
 	}
 	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
 	if err != nil {
+		h.noteFail(r, "messages", model, nil, http.StatusBadGateway, err.Error(), started)
 		writeAnthropicErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -788,12 +796,14 @@ func (h *Handler) anthropicStream(w http.ResponseWriter, r *http.Request, chatRe
 		a, err := h.Pool.Acquire(tried, model, skey)
 		if err != nil {
 			if len(tried) == 0 {
+				h.noteFail(r, "messages", model, nil, http.StatusServiceUnavailable, err.Error(), started)
 				writeAnthropicErr(w, http.StatusServiceUnavailable, err.Error())
 				return
 			}
 			break
 		}
 		tried = append(tried, a.Name)
+		acc = a
 		rs, err := h.Upstream.Do(r.Context(), http.MethodPost, "chat/completions", a.Session, sreq, extra)
 		if err != nil {
 			h.Pool.Release(a)
@@ -817,6 +827,7 @@ func (h *Handler) anthropicStream(w http.ResponseWriter, r *http.Request, chatRe
 		if lastStatus == 0 {
 			lastStatus = http.StatusBadGateway
 		}
+		h.noteFail(r, "messages", model, nil, lastStatus, lastBody, started)
 		writeAnthropicErr(w, lastStatus, lastBody)
 		return
 	}
@@ -883,18 +894,20 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 
 		started := time.Now()
 		var tried []string
+		var lastAcc *pool.Account
 		var lastStatus int
 		var lastBody string
 		for attempt := 0; attempt <= h.Cfg.MaxRetries; attempt++ {
 			acc, err := h.Pool.Acquire(tried, model, "")
 			if err != nil {
 				if len(tried) == 0 {
-					writeErr(w, http.StatusServiceUnavailable, err.Error(), "upstream_error")
+					h.fail(w, r, kind, model, nil, http.StatusServiceUnavailable, err.Error(), started)
 					return
 				}
 				break
 			}
 			tried = append(tried, acc.Name)
+			lastAcc = acc
 			resp, err := h.Upstream.Do(r.Context(), http.MethodPost, suffix, acc.Session, payload, nil)
 			if err != nil {
 				h.Pool.Release(acc)
@@ -933,12 +946,13 @@ func (h *Handler) passthrough(suffix, kind string) http.HandlerFunc {
 		if lastStatus == 0 {
 			lastStatus = http.StatusBadGateway
 		}
-		h.writeUpstreamError(w, lastStatus, lastBody)
+		h.fail(w, r, kind, model, lastAcc, lastStatus, lastBody, started)
 	}
 }
 
 // search POST /v1/search（内置联网检索，只读，不占账号额度）。
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	payload, err := readJSON(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体解析失败", "invalid_request_error")
@@ -946,16 +960,16 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	}
 	session := h.anySession()
 	if session == "" {
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号", "upstream_error")
+		h.fail(w, r, "search", "", nil, http.StatusServiceUnavailable, "没有可用账号", started)
 		return
 	}
 	obj, status, err := h.Upstream.Search(r.Context(), session, payload)
 	if err != nil {
-		writeErr(w, http.StatusBadGateway, err.Error(), "upstream_error")
+		h.fail(w, r, "search", "", nil, http.StatusBadGateway, err.Error(), started)
 		return
 	}
 	if status != 200 {
-		h.writeUpstreamError(w, status, toJSON(obj))
+		h.fail(w, r, "search", "", nil, status, toJSON(obj), started)
 		return
 	}
 	writeJSON(w, obj)
@@ -985,6 +999,29 @@ func (h *Handler) record(r usage.Record) {
 	if h.Ledger != nil {
 		h.Ledger.Record(r)
 	}
+}
+
+// noteFail 记一条失败台账。失败不进台账的话，「请求记录」页只剩成功，
+// 排障只能翻 stderr。
+func (h *Handler) noteFail(r *http.Request, kind, model string, acc *pool.Account, status int, body string, started time.Time) {
+	if status == 0 {
+		status = http.StatusBadGateway
+	}
+	name := ""
+	if acc != nil {
+		name = acc.Name
+	}
+	h.record(usage.Record{
+		Account: name, Model: model, Kind: kind, Status: status,
+		LatencyMs: time.Since(started).Milliseconds(),
+		ClientIP:  clientIP(r), UserAgent: ua(r), Error: truncate(body, 300),
+	})
+}
+
+// fail 记失败台账并回写上游错误体。
+func (h *Handler) fail(w http.ResponseWriter, r *http.Request, kind, model string, acc *pool.Account, status int, body string, started time.Time) {
+	h.noteFail(r, kind, model, acc, status, body, started)
+	h.writeUpstreamError(w, status, body)
 }
 
 func (h *Handler) logCall(acc *pool.Account, model string, status int, d time.Duration, note string) {
