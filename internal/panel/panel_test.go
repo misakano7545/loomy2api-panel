@@ -161,28 +161,33 @@ func TestPanelAuthEnforced(t *testing.T) {
 	}
 }
 
-// TestPanelPasswordOverridesAPIKey 设了 panel_password 就只认它。
-func TestPanelPasswordOverridesAPIKey(t *testing.T) {
+// TestPanelAcceptsAPIKeyAndPassword 登录框写的是「api_key / 面板密码」，两者都
+// 必须能进；只有错误的密钥才该 401。之前设了 panel_password 就把 api_key 完全
+// 忽略，用户贴 key 会被莫名拒绝。
+func TestPanelAcceptsAPIKeyAndPassword(t *testing.T) {
 	pl, _ := newTestPanel(t)
 	pl.cfg.APIKeys = []string{"sk-api"}
 	pl.cfg.PanelPass = "panel-pw"
 
-	// 用 api_key 应被拒
-	req := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
-	req.Header.Set("Authorization", "Bearer sk-api")
-	w := httptest.NewRecorder()
-	pl.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("设了面板密码后 api_key 不应放行，状态码 %d", w.Code)
-	}
-
-	// 用面板密码应放行
-	req = httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
-	req.Header.Set("Authorization", "Bearer panel-pw")
-	w = httptest.NewRecorder()
-	pl.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("面板密码应放行，状态码 %d", w.Code)
+	for _, tc := range []struct {
+		name string
+		key  string
+		want int
+	}{
+		{"api_key 放行", "sk-api", http.StatusOK},
+		{"面板密码放行", "panel-pw", http.StatusOK},
+		{"错误密钥拒绝", "sk-nope", http.StatusUnauthorized},
+		{"空密钥拒绝", "", http.StatusUnauthorized},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/panel/api/overview", nil)
+		if tc.key != "" {
+			req.Header.Set("Authorization", "Bearer "+tc.key)
+		}
+		w := httptest.NewRecorder()
+		pl.ServeHTTP(w, req)
+		if w.Code != tc.want {
+			t.Errorf("%s：状态码 %d，期望 %d", tc.name, w.Code, tc.want)
+		}
 	}
 }
 
