@@ -41,6 +41,7 @@ Loomy2API 是一个自托管的 **反向代理网关**，把讯飞 Loomy（`loom
 | 🔑 **密码自动登录** | 存手机号 + 密码，网关自己走 RSA + HMAC-SHA1 签名登录，14 天登录态到期自动重登 |
 | 📅 **模拟签到领积分** | 复刻官方客户端启动即调的 `points/first-login`（幂等领每日 5000）：面板单号/全量签到按钮、登录成功自动签到、定时额度刷新顺带跨日自动续领 |
 | 🆓 **模型限免识别** | 上游 `/models` 没有结构化倍率字段，倍率与「限时免费」都写在展示名里（`Spark-X2.6-preview(限时免费)(x0.0)`）——网关解析出倍率/限免标记，面板出「限免」标签、限免数统计与「限免优先」排序 |
+| 🖼️ **图像模型分道** | 上游 `type=image` 的模型只能走 `/v1/images/generations`，对 `/chat/completions` 上游一律回 404。网关在目录里标注 `endpoint` / `supports_chat=false`，并在对话端点上直接 400 指路，不让一个选错模型的请求白烧上游、连带把账号打进 404 短冷却 |
 | 🔄 **多账号池** | 余额加权 + 成本分层 + 加权随机选号，Top-5 候选短名单 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却指数退避（封顶可配）、404 短冷却、额度耗尽硬冷却到次日 04:00、连败熔断、单号在途租约 |
 | 🧲 **会话粘性** | 同一会话尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
@@ -114,7 +115,7 @@ curl http://127.0.0.1:17890/v1/responses \
 | POST | `/v1/chat/completions` | OpenAI | 主对话端点（也接受无 `/v1` 前缀） |
 | POST | `/v1/responses` | OpenAI Responses | Codex 等客户端 |
 | POST | `/v1/messages` | Anthropic | Claude Code 等（也接受 `/messages`） |
-| GET | `/v1/models` | OpenAI | 模型目录（上游优先，失败回落内置表） |
+| GET | `/v1/models` | OpenAI | 模型目录（上游优先，失败回落内置表）；图像模型额外带 `endpoint` / `supports_chat=false` |
 | POST | `/v1/embeddings` | OpenAI | 向量 |
 | POST | `/v1/images/generations` | OpenAI | 生图 |
 | POST | `/v1/search` | — | 内置联网检索通道 |

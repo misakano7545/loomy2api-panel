@@ -610,6 +610,10 @@ function mdMatch(m, f) {
   }
   if (f.cap === 'tool' && !(m.capabilities || []).includes('function_calling') &&
       !(m.capabilities || []).includes('tool')) return false;
+  // 端点维度：图像模型只能走 /v1/images/generations，对话端点会 400，
+  // 所以「对话模型」筛选必须把图像模型排除掉，否则用户照列表选就会踩 400。
+  if (f.cap === 'image' && !isImageModel(m)) return false;
+  if (f.cap === 'chat' && isImageModel(m)) return false;
   if (f.cap === 'vision' && !(m.capabilities || []).includes('vision') &&
       !(m.capabilities || []).includes('image')) return false;
   if (f.cap === 'reasoning' && !(m.reasoning_efforts || []).length) return false;
@@ -642,6 +646,9 @@ function mdBaseName(name) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+/* isImageModel 上游 type=image 的模型只能走 /v1/images/generations：
+   对话端点会被网关 400 拒绝（上游本身也只回 404），列表和筛选都按这个口径分。 */
+function isImageModel(m) { return String(m.type || '').toLowerCase() === 'image'; }
 function mdRowHtml(m) {
   const eff = (m.reasoning_efforts || []);
   const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
@@ -656,7 +663,9 @@ function mdRowHtml(m) {
     ? '<span class="tag ok" title="上游标注限时免费，倍率 0">限免</span>'
     : (m.multiplier ? 'x' + Number(m.multiplier).toFixed(1) : '—');
   const defTag = m.is_default_model ? '<span class="tag ok" title="上游默认模型">默认</span>' : '';
-  const typeTag = (m.type === 'image') ? '<span class="tag mute">图像</span>' : '';
+  const typeTag = isImageModel(m)
+    ? '<span class="tag mute" title="图像模型：只能 POST /v1/images/generations，对话端点会被拒绝">图像</span>'
+    : '';
   const dflt = m.default_reasoning_effort
     ? '<span class="tag mute" title="上游默认思考档">' + esc(m.default_reasoning_effort) + '</span>'
     : '—';

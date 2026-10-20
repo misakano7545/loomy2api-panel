@@ -70,6 +70,13 @@ type Model struct {
 	DefaultReasoning string `json:"default_reasoning_effort,omitempty"`
 }
 
+// IsImage 是否图像生成模型（上游 type=image）。
+//
+// 这类模型只能走 /v1/images/generations；上游对它们的 /chat/completions
+// 一律回 404「该模型暂未开放」，而 404 会触发账号短冷却 —— 客户端把图像
+// 模型当对话模型选时，网关不该让上游用 404 来告知我们自己目录里写着的事。
+func (m Model) IsImage() bool { return strings.EqualFold(m.Type, "image") }
+
 // Config 全量配置。字段名即 config.json 的键名（独立结构体便于面板表单绑定）。
 type Config struct {
 	Listen    string   `json:"listen"`

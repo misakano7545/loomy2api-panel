@@ -757,3 +757,155 @@ func TestKnownModelKeepsBareID(t *testing.T) {
 		t.Errorf("未知名字应补前缀：%s", fresh.bodies[0])
 	}
 }
+
+// imageCatalogUpstream 假上游：目录里同时有对话模型与图像模型（上游真实形态：
+// 图像模型 type=image，且 /chat/completions 对它们回 404「该模型暂未开放」）。
+func imageCatalogUpstream(t *testing.T) *fakeUpstream {
+	t.Helper()
+	return newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[
+				{"id":"DeepSeek-V4.1-Flash","name":"DeepSeek V4.1 Flash(x2.0)","type":"chat",
+				 "capabilities":{"reasoning":true,"vision":true,"function_calling":true,"streaming":true}},
+				{"id":"Hy-Image-3.5-preview","name":"Hy image 3.5 preview","type":"image",
+				 "capabilities":{"vision":true,"system_message":true}},
+				{"id":"auto","name":"自动 · 均衡","type":"chat"}
+			]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}`)
+	})
+}
+
+// TestImageModelRejectedOnChatEndpoints 图像模型（type=image）走任何对话端点都必须
+// 在网关本地 400：上游对它们只回 404，而 404 会按 FaultNotFound 短冷却账号。
+// 校验三件事：状态码 400、错误文案指路 images/generations、请求没打到上游。
+func TestImageModelRejectedOnChatEndpoints(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		body string
+		hdr  map[string]string
+	}{
+		{"chat", "/v1/chat/completions",
+			`{"model":"Hy-Image-3.5-preview","messages":[{"role":"user","content":"画只猫"}],"max_tokens":10}`, nil},
+		{"chat-stream", "/v1/chat/completions",
+			`{"model":"Hy-Image-3.5-preview","messages":[{"role":"user","content":"画只猫"}],"stream":true}`, nil},
+		{"chat-prefixed", "/v1/chat/completions",
+			`{"model":"imodel/Hy-Image-3.5-preview","messages":[{"role":"user","content":"画只猫"}]}`, nil},
+		{"responses", "/v1/responses", `{"model":"Hy-Image-3.5-preview","input":"画只猫"}`, nil},
+		{"messages", "/v1/messages",
+			`{"model":"Hy-Image-3.5-preview","max_tokens":16,"messages":[{"role":"user","content":"画只猫"}]}`,
+			map[string]string{"anthropic-version": "2023-06-01"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := imageCatalogUpstream(t)
+			h, p, _ := newTestHandler(t, fs.srv.URL, nil)
+			if list := h.Models.Get(context.Background(), "sess"); len(list) != 3 {
+				t.Fatalf("目录预热失败：%d 个模型", len(list))
+			}
+			before := len(fs.seen)
+
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			for k, v := range tc.hdr {
+				req.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+			h.Routes().ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("状态码 = %d，期望 400；body=%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "/v1/images/generations") {
+				t.Errorf("错误文案应指路生图端点：%s", w.Body.String())
+			}
+			if len(fs.seen) != before {
+				t.Errorf("被拦的请求不该打上游：多出 %d 次", len(fs.seen)-before)
+			}
+			if accs := p.All(); len(accs) != 1 || accs[0].InCooldown() {
+				t.Errorf("选错模型不该冷却账号：%+v", accs)
+			}
+		})
+	}
+}
+
+// TestImageModelStillRoutesToImages 图像模型走生图端点必须放行（不能在 passthrough 前被拦）。
+func TestImageModelStillRoutesToImages(t *testing.T) {
+	fs := newFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/models") {
+			_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"Hy-Image-3.5-preview","type":"image"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"created":1,"data":[{"url":"https://example.com/a.png"}]}`)
+	})
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 1 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"Hy-Image-3.5-preview","prompt":"a cat"}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("生图请求被拦：%d %s", w.Code, w.Body.String())
+	}
+	var ok bool
+	for _, b := range fs.bodies {
+		if strings.Contains(b, `"prompt":"a cat"`) {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Errorf("生图请求没打到上游：%v", fs.bodies)
+	}
+}
+
+// TestModelsMarksImageEndpoint /v1/models 里图像模型要带 endpoint / supports_chat=false，
+// 对话模型不带——客户端才能据此决定调到哪个端点。
+func TestModelsMarksImageEndpoint(t *testing.T) {
+	fs := imageCatalogUpstream(t)
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+	if list := h.Models.Get(context.Background(), "sess"); len(list) != 3 {
+		t.Fatalf("目录预热失败：%d 个模型", len(list))
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("状态码 %d", w.Code)
+	}
+	var out struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	byID := map[string]map[string]any{}
+	for _, m := range out.Data {
+		byID[str(m["id"])] = m
+	}
+	img := byID["Hy-Image-3.5-preview"]
+	if img == nil {
+		t.Fatal("/v1/models 里缺图像模型")
+	}
+	if img["type"] != "image" {
+		t.Errorf("type = %v，期望 image", img["type"])
+	}
+	if img["endpoint"] != "/v1/images/generations" {
+		t.Errorf("endpoint = %v", img["endpoint"])
+	}
+	if img["supports_chat"] != false {
+		t.Errorf("supports_chat = %v，期望 false", img["supports_chat"])
+	}
+	for _, id := range []string{"DeepSeek-V4.1-Flash", "auto"} {
+		if m := byID[id]; m != nil {
+			if _, has := m["endpoint"]; has {
+				t.Errorf("对话模型 %s 不该带 endpoint", id)
+			}
+		}
+	}
+}

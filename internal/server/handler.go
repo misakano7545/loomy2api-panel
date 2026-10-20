@@ -262,6 +262,12 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 			item["is_free"] = true
 			item["multiplier"] = 0
 		}
+		if m.IsImage() {
+			// 图像模型只能走 images/generations：给客户端一个可直接照用的端点提示，
+			// 免得只读 /v1/models 的客户端把它当对话模型选中（上游会回 404）。
+			item["endpoint"] = "/v1/images/generations"
+			item["supports_chat"] = false
+		}
 		if m.IsDefault {
 			item["is_default_model"] = true
 		}
@@ -304,6 +310,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	model := h.resolveModel(req)
+	if h.imageOnlyModel(model) {
+		// 图像模型走对话端点上游必回 404，且 404 会按 FaultNotFound 短冷却账号：
+		// 一个选错模型的请求不该冻掉唯一可用账号，所以在这里直接 400 拦住。
+		rejectImageModel(w, model)
+		return
+	}
 	stream := truthy(req["stream"])
 	skey := pool.SessionKey(req)
 	extra := headerExtras(r, req)
@@ -642,6 +654,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	}
 	model := h.resolveModel(chatReq)
 	chatReq["model"] = model
+	if h.imageOnlyModel(model) {
+		rejectImageModel(w, model)
+		return
+	}
 	skey := pool.SessionKey(chatReq)
 	extra := headerExtras(r, req)
 
@@ -770,6 +786,11 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	chatReq := bridge.ToOpenAI(req)
 	model := h.resolveModel(chatReq)
 	chatReq["model"] = model
+	if h.imageOnlyModel(model) {
+		writeAnthropicErr(w, http.StatusBadRequest,
+			"模型 "+model+" 只支持图像生成，不能用于对话；请改调 POST /v1/images/generations")
+		return
+	}
 	skey := pool.SessionKey(chatReq)
 	extra := headerExtras(r, req)
 
@@ -1023,6 +1044,30 @@ func (h *Handler) knownModel(id string) bool {
 		}
 	}
 	return false
+}
+
+// imageOnlyModel 判断模型是否只能走生图端点（上游目录里 type=image）。
+//
+// 只看缓存（session 传空）：一个参数错的客户端请求不该触发上游 /models 查询，
+// 缓存未命中时宁可放行让上游自己拒绝，也不臆测模型类型。
+func (h *Handler) imageOnlyModel(model string) bool {
+	if h.Models == nil {
+		return false
+	}
+	id := strings.TrimPrefix(model, "imodel/")
+	for _, m := range h.Models.Get(context.Background(), "") {
+		if strings.EqualFold(m.ID, id) {
+			return m.IsImage()
+		}
+	}
+	return false
+}
+
+// rejectImageModel 图像模型被当对话模型用时的 400（OpenAI 形态）。
+func rejectImageModel(w http.ResponseWriter, model string) {
+	writeErr(w, http.StatusBadRequest,
+		"模型 "+model+" 只支持图像生成，不能用于对话；请改调 POST /v1/images/generations",
+		"invalid_request_error")
 }
 
 func (h *Handler) record(r usage.Record) {
