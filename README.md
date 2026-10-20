@@ -13,7 +13,7 @@
   <img alt="Go" src="https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic-412991?style=flat-square">
   <img alt="Deps" src="https://img.shields.io/badge/Dependencies-zero-brightgreen?style=flat-square">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-143%20passing-brightgreen?style=flat-square">
+  <img alt="Tests" src="https://img.shields.io/badge/Tests-182%20passing-brightgreen?style=flat-square">
 </p>
 
 ---
@@ -200,13 +200,14 @@ weight = 余额占比 ×10  +  闲置补偿 ×1  +  成功率 ×3
 ```bash
 go build ./...        # 构建
 go vet ./...          # 静态检查
-go test ./...         # 143 个单测
+go test ./...         # 182 个单测
 gofmt -l .            # 格式检查（应无输出）
 ```
 
 测试覆盖：签名与 RSA 往返、选号分布与排他、冷却退避与封顶、熔断、模型级冷却、
 积分保底、粘性 TTL 与容量、错误分类、SSE 解析与聚合、Anthropic/Responses 双向翻译
-（含工具调用与思考链）、配置读写与脱敏、鉴权、面板渲染与安全头、台账落盘与重启恢复。
+（含工具调用与思考链）、图像模型在对话端点被本地 400 拦住且不打上游、配置读写与脱敏、
+鉴权、面板渲染与安全头、台账落盘与重启恢复。
 
 ## 安全与合规
 

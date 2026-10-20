@@ -177,12 +177,12 @@ body: { model, messages, temperature, max_tokens, stream,
 3. `capabilities` 是**对象**（布尔键 + `input_modalities` 数组），不是数组；
    `type=chat|image` 决定是否图像模型；`auto` 是路由型模型，无倍率。
 4. **图像模型（`type=image`）只服务 `/images/generations`**：对 `/chat/completions`
-   上游统一回 `404 该模型暂未开放，请切换其他模型`（与"模型名写错"不可区分）。
+   上游统一回 `404 该模型暂未开放，请切换其他模型`（与「模型名写错」不可区分）。
    网关因此把它们从对话路径上摘掉——`/v1/models` 对这类条目输出
    `endpoint: "/v1/images/generations"` 与 `supports_chat: false`，三个对话端点
    （`chat_completions` / `responses` / `messages`）在本地直接 400 指路，不打上游。
-   上游 404 会按 `FaultNotFound` 触发账号短冷却，所以这层拦截同时避免"选错模型 →
-   唯一账号被冻 60s"的连带故障。
+   上游 404 会按 `FaultNotFound` 触发账号短冷却，所以这层拦截同时避免「选错模型 →
+   唯一账号被冻 60s」的连带故障。
 
 ### 5.3 额度与积分
 
