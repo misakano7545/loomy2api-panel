@@ -1,24 +1,40 @@
 <p align="center">
-  <b>Loomy2API Panel</b>
+  <h1>Loomy2API Panel</h1>
 </p>
-
-<h1 align="center">Loomy2API</h1>
 
 <p align="center">
   <b>把讯飞 Loomy 账号变成 OpenAI / Anthropic 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  账号池轮转 · 熔断与冷却 · 会话粘性 · 流式 / 非流式 · 零外部依赖 · 单二进制
+  账号池轮转 · 熔断与冷却 · 会话粘性 · 流式 / 非流式 · 零第三方依赖 · 单二进制
 </p>
 
 <p align="center">
   <img alt="Go" src="https://img.shields.io/badge/Go-1.23-00ADD8?logo=go&logoColor=white&style=flat-square">
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic-412991?style=flat-square">
-  <img alt="Deps" src="https://img.shields.io/badge/Dependencies-zero-brightgreen?style=flat-square">
-  <img alt="Tests" src="https://img.shields.io/badge/Tests-207%20passing-brightgreen?style=flat-square">
+  <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-green?style=flat-square">
 </p>
 
 ---
 
-## 这是什么
+> 上游服务为讯飞 Loomy（`loomyad.xunfei.cn`），**非官方、未获授权**；仓库不含任何账号、token 或密钥。
+
+> [!IMPORTANT]
+> **本仓没有需要跟随的上游基线仓**：按同族面板形态自研，协议事实以本仓实测为准，**无官方支持与后续保障**。
+>
+> **维护方式披露**：本仓的 issue / PR 处置、代码审查、测试与修复实现由 **Ekko Studio + Hermes Agent**（AI 编码 agent）辅助完成，合并与发布决策由维护者本人作出。作者是学生，因家庭经济困难，周末需兼职，业余还有摄影、公交等自己的兴趣——**本项目兴趣驱动，更新随缘，不代表作者有全部精力投入维护**，也可能出现较长时间没有提交，请勿当作有 SLA 的商业项目。
+>
+> 风险自评：**上游随时可能收紧导致通道不可用**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
+
+> [!WARNING]
+> **郑重提醒**——这段话针对两类人：**现实中与作者同校的使用者**，以及**拿本项目搭建对外中转站、做批量小号 / 售卖额度等恶意滥用的人**。
+>
+> 作者无法追踪、也不会去追踪任何人的行为，不对任何人行使监控。但必须把话说清楚：上述用法**严重违背上游项目作者与维护者的初衷**，也是消耗本仓作者维护动力的最大来源——本项目免费、开源、由一名学生用课余时间维护，不是给任何人拿去转卖的资源。
+>
+> 如果哪一天这个项目**确确实实让作者心力憔悴、不再有动力维护，本仓也会停止维护**，且不另行通知。上游的今天，可能就是本仓的明天，请自重。
+>
+> 同样的底线也适用于**同校使用者**：若有人出于一己私利，或以作者无法理解、也不知情的行为，把本项目的情况反映到**学校信息中心**、作者所在的**二级学院**，乃至**学院院长与校方其他上级领导**，藉此换取奖学金等个人好处，**本仓也会同时停止维护**。这不是赌气——接受核查、说明与后续处理所占用的时间与心力，已经超出本仓能承受的维护成本。
+
+## 项目简介
 
 Loomy2API 是一个自托管的 **反向代理网关**，把讯飞 Loomy（`loomyad.xunfei.cn`）的账号
 包装成统一的、兼容 OpenAI 与 Anthropic 双协议的 API 服务。
@@ -233,6 +249,12 @@ gofmt -l .            # 格式检查（应无输出）
 
 本项目仅供学习和研究使用。使用者需遵守上游服务条款，自行承担使用风险
 （包括账号封禁、条款违约等）。作者不对任何因使用本项目产生的直接或间接损失负责。
+
+## 血统与致谢
+
+- 本仓按同族面板形态（`workbuddy2api-panel` 一族）自研，**没有需要跟随的上游基线仓**；面板布局与配置分段的相似属同作者实现惯例，协议事实以本仓实测为准。
+- 上游服务为讯飞 Loomy（`loomyad.xunfei.cn`），非官方、未获授权，非本项目上游。
+- 感谢 [workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 把同族骨架开源，本仓的面板与配置口径由它对齐。
 
 ## License
 
