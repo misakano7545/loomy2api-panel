@@ -1031,3 +1031,36 @@ func TestStrictCheckOffAllowsUnknown(t *testing.T) {
 		t.Errorf("关闭严校验后应放行，实际 %d：%s", w.Code, w.Body.String())
 	}
 }
+
+// TestChatImageTagRewriteReachesUpstream 按模型分派图片形态必须在真实请求链路上生效
+// （imgtag_test 只覆盖函数本身，这里是接线检查：resolveModel 是唯一收口处）。
+func TestChatImageTagRewriteReachesUpstream(t *testing.T) {
+	const img = `{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}`
+	for _, tc := range []struct {
+		model   string
+		wantTag bool
+	}{
+		{"imodel/deepseek-v4-flash-0731", true},
+		{"imodel/GLM-5.3-Flash", false},
+	} {
+		fs := newFakeUpstream(t, jsonHandler(200,
+			`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}`))
+		h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+		body := `{"model":"` + tc.model + `","messages":[{"role":"user","content":[` +
+			`{"type":"text","text":"看图"},` + img + `]}],"max_tokens":10}`
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: 状态码 %d：%s", tc.model, w.Code, w.Body.String())
+		}
+		if len(fs.bodies) == 0 {
+			t.Fatalf("%s: 上游没收到请求", tc.model)
+		}
+		// 上游收到的是 JSON 序列化后的文本：Go 会把 < > 转义成 \u003c/\u003e，
+		// 网关按 JSON 解析后仍是 <image_base64>…</image_base64>。
+		got := strings.Contains(fs.bodies[0], `\u003cimage_base64\u003eAAA\u003c/image_base64\u003e`)
+		if got != tc.wantTag {
+			t.Errorf("%s: 上游收到 %s（标记=%v，期望 %v）", tc.model, fs.bodies[0], got, tc.wantTag)
+		}
+	}
+}
