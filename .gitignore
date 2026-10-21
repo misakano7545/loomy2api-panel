@@ -1,6 +1,6 @@
 # 构建产物
-/loomy2api-panel
-/loomy2api-panel.exe
+/loo2api
+/loo2api.exe
 /server
 *.exe
 dist/

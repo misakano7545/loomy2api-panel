@@ -18,7 +18,7 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build \
       -trimpath \
       -ldflags "-s -w -X main.appVersion=${VERSION}" \
-      -o /out/loomy2api-panel ./cmd/server
+      -o /out/loo2api ./cmd/server
 
 # ---- 运行阶段 ----
 FROM alpine:3.20
@@ -30,7 +30,7 @@ RUN apk add --no-cache ca-certificates tzdata \
  && chown -R loomy:loomy /data /app
 
 WORKDIR /app
-COPY --from=build /out/loomy2api-panel /app/loomy2api-panel
+COPY --from=build /out/loo2api /app/loo2api
 
 # 配置与状态都落在 /data（挂卷持久化）：/data/config.json
 # auth_dir / state_file 的相对路径会按 config.json 所在目录解析
@@ -44,5 +44,5 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:17890/healthz >/dev/null 2>&1 || exit 1
 
-ENTRYPOINT ["/app/loomy2api-panel"]
+ENTRYPOINT ["/app/loo2api"]
 CMD ["-config", "/data/config.json"]

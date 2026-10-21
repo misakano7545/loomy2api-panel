@@ -1,6 +1,6 @@
 .PHONY: build run test vet fmt lint clean docker docker-run tidy
 
-BIN      := loomy2api-panel
+BIN      := loo2api
 VERSION  ?= dev
 LDFLAGS  := -s -w -X main.appVersion=$(VERSION)
 

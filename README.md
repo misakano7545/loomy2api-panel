@@ -62,10 +62,10 @@ Loomy2API 是一个自托管的 **反向代理网关**，把讯飞 Loomy（`loom
 
 ```bash
 # 构建
-go build -o loomy2api-panel ./cmd/server
+go build -o loo2api ./cmd/server
 
 # 启动（首次会自动生成 config.json，并在日志里打印随机 api_key）
-./loomy2api-panel -config config.json
+./loo2api -config config.json
 ```
 
 打开 `http://127.0.0.1:17890/panel/`，用日志里打印的 `api_key` 进入面板，
