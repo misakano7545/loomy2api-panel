@@ -1076,6 +1076,8 @@ func (h *Handler) resolveModel(ctx context.Context, payload map[string]any) stri
 	}
 	if payload != nil {
 		payload["model"] = model
+		// deepseek 系只认 <image_base64> 标记，其余认 image_url（见 imgtag.go 的实测依据）。
+		rewriteImageTags(payload, model)
 	}
 	return model
 }
