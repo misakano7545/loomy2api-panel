@@ -522,6 +522,28 @@ func TestAnthropicNonStreamForcesUpstreamStream(t *testing.T) {
 	}
 }
 
+// TestCollectStreamPreservesUpstreamStatus /v1/responses 和 /v1/messages 的非流式
+// 走流式聚合，上游 429 必须按 429 透出：agent 侧靠状态码决定退避，改判 502 会被
+// 当成网关坏了直接放弃。
+func TestCollectStreamPreservesUpstreamStatus(t *testing.T) {
+	fs := newFakeUpstream(t, jsonHandler(429, `{"error":{"message":"模型服务当前繁忙","type":"rate_limit_error"}}`))
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	cases := []struct{ path, body string }{
+		{"/v1/responses", `{"model":"m","input":"hi","stream":false}`},
+		{"/v1/messages", `{"model":"m","max_tokens":64,"messages":[{"role":"user","content":"hi"}],"stream":false}`},
+		{"/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}`},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(c.body))
+		w := httptest.NewRecorder()
+		h.Routes().ServeHTTP(w, req)
+		if w.Code != http.StatusTooManyRequests {
+			t.Errorf("%s 状态码 = %d，期望 429（body=%s）", c.path, w.Code, w.Body.String())
+		}
+	}
+}
+
 // TestSSEStreamParsing SSE 解析器：跨包边界与 [DONE]。
 func TestSSEStreamParsing(t *testing.T) {
 	raw := "data: {\"a\":1}\n\ndata: {\"b\":2}\n\ndata: [DONE]\n\n"

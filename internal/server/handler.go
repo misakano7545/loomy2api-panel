@@ -480,11 +480,11 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 		close(done)
 	}()
 
-	obj, err := h.collectStream(r.Context(), sreq, model, skey, extra)
+	obj, status, err := h.collectStream(r.Context(), sreq, model, skey, extra)
 	if err != nil {
-		h.noteFail(r, "chat", model, nil, http.StatusBadGateway, err.Error(), started)
+		h.noteFail(r, "chat", model, nil, status, err.Error(), started)
 		writeJSON(w, map[string]any{"error": map[string]any{
-			"message": err.Error(), "type": "upstream_error", "code": 502,
+			"message": err.Error(), "type": "upstream_error", "code": status,
 		}})
 		return
 	}
@@ -498,18 +498,21 @@ func (h *Handler) chatAggregated(w http.ResponseWriter, r *http.Request, req map
 // 内部强制 stream=true：调用方（/v1/messages、/v1/responses、长任务）传进来的
 // 请求体可能是 stream:false，而这里按 SSE 解析响应——不覆盖的话上游返回普通 JSON，
 // 解析器读到 0 帧，客户端会拿到一个空回答。
-func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, skey string, extra map[string]string) (map[string]any, error) {
+func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, skey string, extra map[string]string) (map[string]any, int, error) {
 	upReq := cloneMap(req)
 	upReq["stream"] = true
 
 	var tried []string
 	var lastErr error
+	// 上游状态码原样带出去：/v1/responses 和 /v1/messages 都走这里，把 429 改判成
+	// 502 会让 agent 侧（Codex/Claude Code）看不出该退避还是该换网关。
+	status := http.StatusBadGateway
 
 	for attempt := 0; attempt <= h.Cfg.MaxRetries; attempt++ {
 		acc, err := h.Pool.Acquire(tried, model, skey)
 		if err != nil {
 			if len(tried) == 0 {
-				return nil, err
+				return nil, http.StatusServiceUnavailable, err
 			}
 			break
 		}
@@ -526,6 +529,7 @@ func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, 
 		if resp.Status != http.StatusOK {
 			body := resp.BodyText()
 			h.Pool.Release(acc)
+			status = resp.Status
 			h.Pool.ReportFailure(acc, resp.Status, body, skey, model)
 			lastErr = fmt.Errorf("上游 HTTP %d: %s", resp.Status, truncate(body, 200))
 			continue
@@ -555,12 +559,12 @@ func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, 
 			Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 			LatencyMs: time.Since(started).Milliseconds(),
 		})
-		return out, nil
+		return out, 0, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("所有账号都失败了")
 	}
-	return nil, lastErr
+	return nil, status, lastErr
 }
 
 // chatStream 流式请求：把上游 SSE 原样转发给客户端。
@@ -702,9 +706,9 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		h.responsesStream(w, r, chatReq, model, skey, extra)
 		return
 	}
-	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
+	obj, status, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
 	if err != nil {
-		h.fail(w, r, "responses", model, nil, http.StatusBadGateway, err.Error(), started)
+		h.fail(w, r, "responses", model, nil, status, err.Error(), started)
 		return
 	}
 	writeJSON(w, bridge.ChatToResponse(obj, model))
@@ -844,10 +848,10 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		h.anthropicStream(w, r, chatReq, model, skey, extra)
 		return
 	}
-	obj, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
+	obj, status, err := h.collectStream(r.Context(), chatReq, model, skey, extra)
 	if err != nil {
-		h.noteFail(r, "messages", model, nil, http.StatusBadGateway, err.Error(), started)
-		writeAnthropicErr(w, http.StatusBadGateway, err.Error())
+		h.noteFail(r, "messages", model, nil, status, err.Error(), started)
+		writeAnthropicErr(w, status, err.Error())
 		return
 	}
 	writeJSON(w, bridge.ToAnthropic(obj, model))
