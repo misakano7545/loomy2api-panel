@@ -340,6 +340,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stream := truthy(req["stream"])
+	// 工具面观测：只数个数，不解析工具名与参数、不进日志。挂到 context 是因为
+	// 失败台账在 noteFail 里组 Record，那里只有 *http.Request，拿不到请求体。
+	if n := declTools(req); n > 0 {
+		r = r.WithContext(context.WithValue(r.Context(), toolsKey{}, n))
+	}
 	skey := pool.SessionKey(req)
 	extra := headerExtras(r, req)
 
@@ -409,6 +414,7 @@ func (h *Handler) chatOnce(w http.ResponseWriter, r *http.Request, req map[strin
 				Prompt: prompt, Completion: completion, Reasoning: reasoning,
 				Points: pts, LatencyMs: time.Since(started).Milliseconds(),
 				ClientIP: clientIP(r), UserAgent: ua(r), RequestID: rid(resp.Header),
+				ToolsDeclared: declTools(req), ToolCalls: toolCallsIn(obj),
 			})
 			h.logCall(acc, model, 200, time.Since(started), usageSummary(prompt, completion, pts, reasoning))
 			w.Header().Set("X-Loomy-Account", acc.Name)
@@ -557,7 +563,8 @@ func (h *Handler) collectStream(ctx context.Context, req map[string]any, model, 
 		h.record(usage.Record{
 			Account: acc.Name, Model: model, Kind: "chat", Stream: false, Status: 200,
 			Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
-			LatencyMs: time.Since(started).Milliseconds(),
+			LatencyMs:     time.Since(started).Milliseconds(),
+			ToolsDeclared: declTools(req), ToolCalls: toolCallsIn(out),
 		})
 		return out, 0, nil
 	}
@@ -626,6 +633,7 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 
 	var firstAt time.Time
 	agg := newAggregator()
+	toolCalls := 0
 
 	sc := newSSEStream(lastResp.Body)
 	for {
@@ -641,6 +649,10 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 			firstAt = time.Now()
 		}
 		agg.Feed(obj)
+		// 在帧发给客户端这一刻置位：之后客户端断开也算它看到过工具调用。
+		if toolCallsIn(obj) > 0 {
+			toolCalls = 1
+		}
 		buf, err := json.Marshal(obj)
 		if err != nil {
 			continue
@@ -670,6 +682,7 @@ func (h *Handler) chatStream(w http.ResponseWriter, r *http.Request, req map[str
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: elapsed.Milliseconds(), TTFBMs: ttfb,
 		ClientIP: clientIP(r), UserAgent: ua(r),
+		ToolsDeclared: declTools(req), ToolCalls: toolCalls,
 	})
 	h.logStream(lastAcc, model, elapsed, ttfb, completion, reasoning, pts)
 }
@@ -1217,6 +1230,7 @@ func (h *Handler) noteFail(r *http.Request, kind, model string, acc *pool.Accoun
 		Account: name, Model: model, Kind: kind, Status: status,
 		LatencyMs: time.Since(started).Milliseconds(),
 		ClientIP:  clientIP(r), UserAgent: ua(r), Error: truncate(body, 300),
+		ToolsDeclared: toolsDeclared(r),
 	})
 }
 
@@ -1353,6 +1367,42 @@ func parseSSELine(line []byte) (map[string]any, bool, bool) {
 		return nil, false, false
 	}
 	return obj, false, true
+}
+
+// toolsKey 把入站 tools 声明数带进 request context，供 noteFail 组失败记录用。
+type toolsKey struct{}
+
+func toolsDeclared(r *http.Request) int {
+	n, _ := r.Context().Value(toolsKey{}).(int)
+	return n
+}
+
+// declTools 入站 body 顶层 tools 的个数——只数个数，不解析工具名与参数。
+func declTools(req map[string]any) int {
+	tools, _ := req["tools"].([]any)
+	return len(tools)
+}
+
+// toolCallsIn 数一个 chat.completion 响应或流式帧里 choices[0] 的 tool_calls 个数。
+// message 与 delta 都认（与聚合器一致），组包形态也有 []any / []map[string]any 两种：
+// 只认一种的路径会恒记 0，停摆率直接翻倍。
+func toolCallsIn(obj map[string]any) int {
+	choices, _ := obj["choices"].([]any)
+	if len(choices) == 0 {
+		return 0
+	}
+	ch, _ := choices[0].(map[string]any)
+	msg, _ := ch["message"].(map[string]any)
+	if msg == nil {
+		msg, _ = ch["delta"].(map[string]any)
+	}
+	switch calls := msg["tool_calls"].(type) {
+	case []any:
+		return len(calls)
+	case []map[string]any:
+		return len(calls)
+	}
+	return 0
 }
 
 // Aggregator 把 SSE 增量聚合成一条完整响应。

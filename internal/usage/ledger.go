@@ -34,6 +34,11 @@ type Record struct {
 	UserAgent  string `json:"ua,omitempty"`
 	RequestID  string `json:"rid,omitempty"`
 	Error      string `json:"error,omitempty"`
+
+	// 工具面观测：客户端声明的工具数 / 实际工具调用数。声明>0 而调用==0 就是客户端
+	// 眼里一次什么都没做的回合，单看任一数都判不出来。内存与落盘共用本结构。
+	ToolsDeclared int `json:"tools_declared,omitempty"`
+	ToolCalls     int `json:"tool_calls,omitempty"`
 }
 
 // Ledger 请求台账。
