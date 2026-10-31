@@ -4,6 +4,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/misakano7545/loomy2api-panel/internal/safefile"
 	"os"
 	"path/filepath"
 	"sort"
@@ -580,11 +581,8 @@ func (p *Pool) Flush() {
 	if err := os.MkdirAll(filepath.Dir(p.stateFp), 0o755); err != nil {
 		return
 	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err == nil {
+	// safefile.Write：临时文件 fsync 后才 rename，掉电不会留下长度对、内容全零的状态盘。
+	if err := safefile.Write(p.stateFp, buf, 0o600); err == nil {
 		p.dirty.Store(false)
 	}
 }

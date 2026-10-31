@@ -10,18 +10,35 @@
 package panel
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
-var indexHTML []byte
+var indexHTMLRaw []byte
 
 //go:embed app.js
 var appJS []byte
 
 //go:embed theme.js
 var themeJS []byte
+
+// fingerprint 内容指纹（sha256 前 8 字节）。脚本 URL 因此绑到内容上：反代/扩展/离线缓存
+// 回放旧 app.js 时，新页面要的 URL 必然不同，不会出现「新 HTML 配旧 JS」的半截页面。
+func fingerprint(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
+// indexHTML 运行时把无查询串的 script src 换成带指纹的 URL（源码里保持可读）。
+var indexHTML = func() []byte {
+	s := strings.ReplaceAll(string(indexHTMLRaw), `src="theme.js"`, `src="theme.js?v=`+fingerprint(themeJS)+`"`)
+	s = strings.ReplaceAll(s, `src="app.js"`, `src="app.js?v=`+fingerprint(appJS)+`"`)
+	return []byte(s)
+}()
 
 // csp 内容安全策略（严格版，无需 unsafe-inline 脚本）：
 //   - default-src 'none'   默认全禁，逐个开口

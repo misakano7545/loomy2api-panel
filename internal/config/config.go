@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/misakano7545/loomy2api-panel/internal/safefile"
 	"net"
 	"os"
 	"path/filepath"
@@ -441,11 +442,7 @@ func (c *Config) Save(patch map[string]any) ([]string, error) {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
 		return nil, err
 	}
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(tmp, c.path); err != nil {
+	if err := safefile.Write(c.path, buf, 0o600); err != nil {
 		return nil, err
 	}
 

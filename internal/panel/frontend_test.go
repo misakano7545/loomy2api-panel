@@ -58,7 +58,7 @@ func TestNavMatchesViews(t *testing.T) {
 // TestThemePreloadBeforeStyle 主题预热脚本必须在样式表之前，否则刷新会先闪深色。
 func TestThemePreloadBeforeStyle(t *testing.T) {
 	html := string(indexHTML)
-	i := strings.Index(html, `src="theme.js"`)
+	i := strings.Index(html, `src="theme.js?`) // 运行时带内容指纹，源码里是无查询串形态
 	j := strings.Index(html, "<style>")
 	if i < 0 || j < 0 {
 		t.Fatal("缺少 theme.js 或内联样式块")

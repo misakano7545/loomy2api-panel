@@ -68,7 +68,7 @@ func TestIndexServesHTML(t *testing.T) {
 	if !strings.Contains(body, "Loomy2API") {
 		t.Error("页面缺少标题")
 	}
-	if !strings.Contains(body, `src="app.js"`) {
+	if !strings.Contains(body, `src="app.js?`) {
 		t.Error("页面应通过同源脚本加载 app.js（CSP script-src 'self'）")
 	}
 	// 页面不能有内联脚本或内联事件处理器（否则 CSP 会拦掉）
