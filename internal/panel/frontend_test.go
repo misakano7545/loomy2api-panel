@@ -80,3 +80,17 @@ func TestNoInlineHandlers(t *testing.T) {
 		t.Error("不应有内联脚本")
 	}
 }
+
+// TestStatsStripSingleRow：KPI 条靠 auto-fit 排成一行，写死列数会让多出来的格
+// 单独掉到第二行，破坏与基准一致的「单行等分 + 细分割线」。
+func TestStatsStripSingleRow(t *testing.T) {
+	html := string(indexHTMLRaw)
+	i := strings.Index(html, ".stats {")
+	if i < 0 {
+		t.Fatal("index.html 里找不到 .stats 规则")
+	}
+	rule := html[i : i+strings.Index(html[i:], "}")]
+	if !strings.Contains(rule, "auto-fit") {
+		t.Errorf(".stats 应使用 auto-fit 自适应列数，实际规则：%s", rule)
+	}
+}
