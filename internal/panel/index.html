@@ -643,6 +643,32 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .ln .c-task { color: var(--accent); }
   .ln .c-chat { color: var(--ok); }
   .ln .c-sys { color: var(--ink-3); }
+
+/* 分页条：账号池 / 请求记录 / 积分流水 / 用量明细等长列表共用 */
+.pgf { border-top: 1px solid var(--line); padding: 8px 12px 10px; }
+.pg { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-3); }
+.pg-btn { min-width: 28px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--ink-2); cursor: pointer; font-size: 12.5px; line-height: 1.5; }
+.pg-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pg-btn.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.pg-btn:disabled { opacity: .45; cursor: default; }
+.pg-gap { padding: 0 1px; }
+.pg-info { margin-left: auto; white-space: nowrap; }
+.pg-size { width: auto; padding: 3px 6px; font-size: 12.5px; border-radius: 6px; }
+@media (max-width: 560px) {
+  .pg-info { margin-left: 0; order: 9; width: 100%; }
+  .pg-size { margin-left: auto; }
+}
+
+/* 可排序表头（点击切换 升序/降序） */
+th[data-sort] { cursor: pointer; user-select: none; white-space: nowrap; }
+th[data-sort]:hover { color: var(--accent); }
+th.sorted { color: var(--accent); }
+th.sorted[data-dir="asc"]::after { content: " ▲"; font-size: 10px; }
+th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
+/* 到期列：剩余天数用弱化色，0 天（今天到期）标黄 */
+.acc .due-in { color: var(--ink-3); font-size: 11px; }
+.acc .due-now { color: var(--warn); font-weight: 600; }
 </style>
 <body>
 <div class="shell">
@@ -712,41 +738,36 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
-      <!-- 到期提醒：数据取自 /overview 的账号额度快照（daily_balance + daily_cycle_date），
-           打开页面零上游请求。Loomy 的每日赠送额度随周期滚存失效，长期积分不到期。 -->
-      <div class="box">
-        <header>
-          <h3>积分到期提醒 <span class="hint">按自然日聚合 · 日均需耗 = 该日到期积分 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</span></h3>
-          <span class="grow"></span>
-          <span class="note" id="expNote"></span>
-        </header>
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th>账号</th><th>最近到期</th><th class="num">距到期</th>
-            <th class="num">该日到期</th><th class="num">日均需耗</th>
-          </tr></thead>
-          <tbody id="expBody"></tbody>
-        </table>
-        </div>
-      </div>
+      <!-- 「积分到期提醒」原为独立表格（133 行、与账号池同一批数据），已并入账号池：
+           账号行新增「到期」列（可排序），表头有「有到期积分」筛选，这里只留一行汇总。 -->
 
       <div class="box">
         <header>
           <h3>账号池 <span class="hint">登录成功自动签到领每日积分 · 每日周期上游自动刷新</span></h3>
           <span class="grow"></span>
+          <span class="note" id="expNote"></span>
           <span class="note" id="accNote"></span>
+          <select id="accFilter" class="xs" aria-label="按状态筛选账号">
+            <option value="all">全部账号</option>
+            <option value="ok">可用</option>
+            <option value="cool">冷却中</option>
+            <option value="paused">已暂停选号</option>
+            <option value="disabled">已禁用</option>
+            <option value="due">有到期积分</option>
+          </select>
           <button class="xs" id="btnRemarks">备注</button>
           <button class="xs" id="btnCheckinAll">全部签到</button>
           <button class="xs" id="btnOnboardingAll" title="领新手任务：8 项合计 10000 积分，服务端不校验前置行为，零 token 消耗">领新手任务</button>
           <button class="xs" id="btnRefreshAll">全部刷新额度</button>
         </header>
         <div class="tbl-wrap">
-        <table class="acc">
+        <table class="acc" data-sortkey="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th class="num">用量</th><th class="num">最近成功</th><th class="c-acts"></th>
+            <th data-sort="name">账号</th><th data-sort="status">状态</th><th data-sort="credit">积分</th>
+            <th data-sort="ok">成功 / 失败</th><th data-sort="inflight">在途</th>
+            <th class="num" data-sort="usage">用量</th><th class="num" data-sort="due" title="每日赠送积分的最近到期日与剩余天数">到期</th>
+            <th class="num" data-sort="last">最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -866,7 +887,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </header>
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
       </div>
-      <div id="pkDetail"></div>
+      <div class="box">
+        <header>
+          <h3>积分口径明细 <span class="hint">每个账号的包 / 活动来源 · 已入账来源的余额已并入上方口径，不重复计数</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="pkdNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>账号</th><th>口径 / 来源</th>
+              <th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>
+              <th class="num">发放</th><th class="num">到期</th>
+            </tr></thead>
+            <tbody id="pkdBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- 用量 -->
@@ -1102,12 +1140,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnReqReload">重新读取</button>
         </div>
         <div class="tbl-wrap req-wrap">
-          <table class="acc req">
+          <table class="acc req" data-sortkey="req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
+              <th data-sort="time">时间</th><th data-sort="status">结果</th><th>模型</th><th>账号</th>
               <th class="num" title="声明数 / 实际调用数：声明了工具却一次没调用 = 客户端眼里这一轮工具停摆">工具</th>
               <th>来源 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+              <th class="num" data-sort="latency">耗时</th><th class="num" data-sort="tokens">Token</th><th class="num" data-sort="points">积分</th><th>请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>

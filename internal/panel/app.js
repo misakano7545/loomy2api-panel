@@ -98,6 +98,153 @@ function esc(s) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 }
+/* ── 分页（所有长列表共用）───────────────────────────────────────────
+   台账数据本来就在内存里，分页不是为了少取，是为了别把几百行一次塞进 DOM：
+   136 个账号 = 1300+ 个单元格，一次重渲染会明显卡顿，页面也会长得难用。
+   状态按 key 分开存，每页条数记 localStorage；筛选条件变化时回到第 1 页。 */
+const PG = {};
+const PG_TOTAL = {};
+const PG_RENDER = {};
+const PG_SIZES = [10, 20, 50, 100, 200];
+const PG_DEFAULT = 20;
+const LAST = {};          // 各列表最近一次的数据（换页时重渲染用）
+
+function pgState(key, total) {
+  let st = PG[key];
+  if (!st) {
+    let size = PG_DEFAULT;
+    try {
+      const saved = Number(localStorage.getItem('pg.size.' + key));
+      if (PG_SIZES.indexOf(saved) >= 0) size = saved;
+    } catch (e) { /* 隐私模式忽略 */ }
+    st = PG[key] = { page: 0, size: size, sig: null };
+  }
+  const pages = Math.max(1, Math.ceil(total / st.size));
+  if (st.page > pages - 1) st.page = pages - 1;
+  if (st.page < 0) st.page = 0;
+  return st;
+}
+
+// pgSig 筛选条件变了就翻回第一页：否则「第 5 页」在结果只剩 2 条时会显示空表。
+function pgSig(key, sig) {
+  const st = PG[key];
+  if (!st) { pgState(key, 0); }
+  const s = PG[key];
+  if (s.sig !== sig) { s.sig = sig; s.page = 0; }
+}
+
+// pgApply 切片 + 记总数 + 挂分页条；返回当前页该渲染的行。
+function pgApply(tbId, key, list) {
+  const st = pgState(key, list.length);
+  PG_TOTAL[key] = list.length;
+  const start = st.page * st.size;
+  pgFoot(tbId, key, list.length, st);
+  return list.slice(start, start + st.size);
+}
+
+function pgBtn(key, d, label, dis, on) {
+  return '<button class="pg-btn' + (on ? ' on' : '') + '" data-pg="' + key + '" data-d="' + d + '"' +
+    (dis ? ' disabled' : '') + '>' + label + '</button>';
+}
+
+function pgHtml(key, total, st) {
+  const pages = Math.max(1, Math.ceil(total / st.size));
+  const cur = st.page;
+  const nums = [];
+  if (pages <= 7) {
+    for (let i = 0; i < pages; i++) nums.push(i);
+  } else {
+    const keep = {};
+    [0, pages - 1, cur - 1, cur, cur + 1].forEach(i => { if (i >= 0 && i < pages) keep[i] = 1; });
+    const arr = Object.keys(keep).map(Number).sort((a, b) => a - b);
+    for (let i = 0; i < arr.length; i++) {
+      if (i && arr[i] - arr[i - 1] > 1) nums.push(-1);
+      nums.push(arr[i]);
+    }
+  }
+  const sizeOpts = PG_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === st.size ? ' selected' : '') + '>' + n + ' 条/页</option>').join('');
+  return '<div class="pg">' +
+    pgBtn(key, 'prev', '‹ 上一页', cur === 0) +
+    nums.map(i => i < 0 ? '<span class="pg-gap">…</span>' : pgBtn(key, i, String(i + 1), false, i === cur)).join('') +
+    pgBtn(key, 'next', '下一页 ›', cur >= pages - 1) +
+    '<span class="pg-info">共 ' + total + ' 条 · 第 ' + (cur + 1) + '/' + pages + ' 页</span>' +
+    '<select class="pg-size" data-pgsize="' + key + '">' + sizeOpts + '</select>' +
+    '</div>';
+}
+
+// pgFoot 在表格下方挂/更新分页条；只有一页时移除，避免占位。
+//
+// 分页条**不能**放进 <tfoot>：账号表这类宽表在 .tbl-wrap 里横向滚动
+// （实测表 1236px / 容器 927px），tfoot 会跟着表格一起被滚出右边界，等于没有。
+// 所以挂在滚动容器之外的一个 div 上，宽度跟随容器，任何滚动位置都看得见。
+function pgFoot(tbId, key, total, st) {
+  const tb = $(tbId);
+  if (!tb) return;
+  const table = tb.closest('table');
+  if (!table) {
+    // 非表格容器（积分构成的卡片网格）：分页条直接挂在容器后面。
+    const id = 'pg-' + key;
+    let bar = document.getElementById(id);
+    if (total <= st.size) {
+      if (bar && bar.parentElement) bar.parentElement.removeChild(bar);
+      return;
+    }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = id;
+      bar.className = 'pgf';
+      bar.setAttribute('data-pgkey', key);
+      tb.parentElement.insertBefore(bar, tb.nextSibling);
+    }
+    bar.innerHTML = pgHtml(key, total, st);
+    return;
+  }
+  // 找到最近的横向滚动容器（.tbl-wrap）；有就挂到它外面。
+  let host = table;
+  const wrap = table.parentElement;
+  if (wrap && getComputedStyle(wrap).overflowX === 'auto') host = wrap;
+
+  const id = 'pg-' + key;
+  let bar = document.getElementById(id);
+  if (total <= st.size) {
+    if (bar && bar.parentElement) bar.parentElement.removeChild(bar);
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = id;
+    bar.className = 'pgf';
+    bar.setAttribute('data-pgkey', key);
+    host.parentElement.insertBefore(bar, host.nextSibling);
+  }
+  bar.innerHTML = pgHtml(key, total, st);
+}
+
+// 事件委托：换页 / 改每页条数。重渲染会换掉 innerHTML，委托式监听不会丢。
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-pg]');
+  if (!b || b.disabled) return;
+  const key = b.dataset.pg, d = b.dataset.d, st = PG[key];
+  if (!st) return;
+  const pages = Math.max(1, Math.ceil((PG_TOTAL[key] || 0) / st.size));
+  // data-d：'prev' / 'next' / 目标页索引。之前正数一律当"下一页"，点页码只前进一页。
+  st.page = d === 'prev' ? Math.max(0, st.page - 1)
+    : d === 'next' ? Math.min(pages - 1, st.page + 1)
+    : Math.max(0, Math.min(pages - 1, Number(d) || 0));
+  if (PG_RENDER[key]) PG_RENDER[key]();
+});
+document.addEventListener('change', ev => {
+  const s = ev.target.closest('select[data-pgsize]');
+  if (!s) return;
+  const key = s.dataset.pgsize, st = PG[key];
+  if (!st) return;
+  st.size = Number(s.value) || PG_DEFAULT;
+  st.page = 0;
+  try { localStorage.setItem('pg.size.' + key, String(st.size)); } catch (e) {}
+  if (PG_RENDER[key]) PG_RENDER[key]();
+});
+
 function ago(iso) {
   if (!iso) return '—';
   const t = new Date(iso).getTime();
@@ -245,6 +392,120 @@ function trangeLabel(id) {
   return f(st.from) + ' → ' + f(st.to);
 }
 
+/* ── 列排序 ────────────────────────────────────────────────────────
+   点表头切换 升序/降序；只有「账号池」和「请求记录」开了表头排序 ——
+   用量/模型目录本来就有自己的排序下拉，再叠一套表头排序只是噪音。 */
+const SORT = {};
+// DESC_FIRST 首次点击按降序排的列（其余按升序）。
+const DESC_FIRST = new Set(['credit', 'ok', 'inflight', 'usage', 'last',
+  'latency', 'tokens', 'points']);
+
+function sortState(key, defField, defDir) {
+  if (!SORT[key]) SORT[key] = { field: defField, dir: defDir };
+  return SORT[key];
+}
+
+// sortApply 按当前排序状态返回新数组（不改原数组）。
+function sortApply(key, rows, getters, defField, defDir) {
+  const st = sortState(key, defField, defDir);
+  const g = getters[st.field] || getters[defField];
+  const out = rows.slice();
+  out.sort((a, b) => {
+    const va = g(a), vb = g(b);
+    if (va === vb) return 0;
+    return (va < vb ? -1 : 1) * st.dir;
+  });
+  return out;
+}
+
+// sortMark 把 ▲/▼ 标在当前排序列上（表头由 render 后统一刷新）。
+function sortMark(tbId, key) {
+  const tb = $(tbId);
+  const table = tb && tb.closest('table');
+  const st = SORT[key];
+  if (!table || !st) return;
+  table.querySelectorAll('th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === st.field;
+    th.classList.toggle('sorted', on);
+    if (on) th.dataset.dir = st.dir > 0 ? 'asc' : 'desc';
+    else th.removeAttribute('data-dir');
+  });
+}
+
+// 表头点击：同列再点切方向，换列则从升序开始，并翻回第一页。
+document.addEventListener('click', ev => {
+  const th = ev.target.closest('th[data-sort]');
+  if (!th) return;
+  const table = th.closest('table');
+  const key = table && table.dataset.sortkey;
+  if (!key) return;
+  const st = sortState(key, th.dataset.sort, 1);
+  const field = th.dataset.sort;
+  if (st.field === field) {
+    st.dir = -st.dir;   // 同一列再点：翻转方向
+  } else {
+    // 数值列首次点击从大到小（积分/耗时/Token 这些「最大的最该先看」）；
+    // 到期要的是「最快过期的先看」，状态要的是「可用的先看」，都用升序。
+    st.field = field;
+    st.dir = DESC_FIRST.has(field) ? -1 : 1;
+  }
+  if (PG[key]) PG[key].page = 0;
+  if (PG_RENDER[key]) PG_RENDER[key]();
+});
+
+/* ── 账号池：状态筛选 + 到期信息（原「积分到期提醒」表并入这里）── */
+let accFilter = 'all';
+
+// accDue 每日赠送积分的到期信息；没有每日余额返回 null。
+function accDue(a) {
+  const bal = Number(a && a.daily_balance || 0);
+  if (!bal || !a.daily_cycle_date) return null;
+  const cyc = new Date(a.daily_cycle_date + 'T00:00:00');
+  if (isNaN(cyc.getTime())) return null;
+  const exp = new Date(cyc.getTime() + 86400000);
+  const days = Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000));
+  return { days: days, remain: bal, quota: Number(a.daily_quota || 0), exp: exp,
+           checked: !!a.checkin_done };
+}
+
+// accRank 状态排序权重：可用 < 冷却 < 暂停 < 禁用。
+function accRank(a) {
+  if (a && a.disabled) return 3;
+  if (a && a.paused) return 2;
+  const cool = Math.max(Number(a && a.cooldown_seconds_left || 0), Number(a && a.breaker_seconds_left || 0));
+  if (cool > 0) return 1;
+  return a && a.session_valid ? 0 : 1;
+}
+
+function accMatch(a, f) {
+  if (!f || f === 'all') return true;
+  if (f === 'due') return !!accDue(a);
+  if (f === 'disabled') return !!a.disabled;
+  if (f === 'paused') return !!a.paused && !a.disabled;
+  if (f === 'ok') return accRank(a) === 0;
+  if (f === 'cool') return accRank(a) === 1 && !a.disabled && !a.paused;
+  return true;
+}
+
+const ACC_GET = {
+  name: a => String(a.name || '').toLowerCase(),
+  status: a => accRank(a),
+  credit: a => Number(a.available || 0),
+  ok: a => Number(a.success_count || 0),
+  inflight: a => Number(a.inflight || 0),
+  usage: a => Number((a.token_usage || {}).total_tokens || 0),
+  due: a => { const d = accDue(a); return d ? d.days : 9999; },
+  last: a => Number(a.last_success || 0),
+};
+
+const REQ_GET = {
+  time: e => Number(e && e.t || 0),
+  status: e => Number(e && e.status || 0),
+  latency: e => Number(e && e.latency_ms || 0),
+  tokens: e => Number(e && e.prompt || 0) + Number(e && e.completion || 0),
+  points: e => Number(e && e.points || 0),
+};
+
 /* ── 数字格式 ─────────────────────────────────────────────────────── */
 function fmtTok(n) {
   n = Number(n || 0);
@@ -358,14 +619,22 @@ function modelLocksHtml(cooldowns, now) {
 
 function renderAccounts(list) {
   const tb = $('accBody');
+  LAST.acc = list;
+  const visible = list.filter(a => accMatch(a, accFilter));
+  const pageRows = pgApply('accBody', 'acc', sortApply('acc', visible, ACC_GET, 'name', 1));
+  sortMark('accBody', 'acc');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
+    return;
+  }
+  if (!visible.length) {
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty">当前筛选没有匹配的账号</div></td></tr>';
     return;
   }
   const now = Date.now();
   // 有可用余额 → 进度条按自身 剩余/池内最高；未知 → 空条。
   const maxCred = Math.max(1, ...list.map(s => Number(s.available || 0)));
-  tb.innerHTML = list.map(s => {
+  tb.innerHTML = pageRows.map(s => {
     const st = accountStatus(s, now);
     const err = s.last_error ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.last_error) + '</div>' : '';
     const locks = modelLocksHtml(s.model_cooldowns, now);
@@ -386,6 +655,19 @@ function renderAccounts(list) {
     const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
       (rate === '—' ? '' : ' / ' + rate);
     const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
+    // 每日赠送积分的到期信息（原独立「积分到期提醒」表并入此列）
+    const due = accDue(s);
+    let dueCell = '<span class="muted">—</span>';
+    let dueTip = '没有每日赠送余额（长期积分不到期）';
+    if (due) {
+      const dTxt = due.days === 0 ? '今天' : due.days === 1 ? '明天' : due.days + ' 天';
+      dueCell = fmtPoints(due.remain) + '<div class="' + (due.days === 0 ? 'due-now' : 'due-in') + '">' + dTxt + '</div>';
+      dueTip = '该日到期 ' + fmtPoints(due.remain) + ' · 距到期 ' + due.days + ' 天' +
+        (due.quota ? ' · 每日额度 ' + fmtPoints(due.quota) : '') +
+        (due.checked ? ' · 今日已签到' : ' · 今日未签到') +
+        '\n日均需耗 ' + fmtPoints(Math.ceil(due.remain / Math.max(1, due.days))) +
+        '\n上游按失效时刻先后优先扣减（FEFO）';
+    }
     return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
@@ -404,6 +686,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
+      '<td class="num" title="' + esc(dueTip) + '">' + dueCell + '</td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success ? new Date(s.last_success * 1000).toISOString() : '') + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
@@ -426,13 +709,15 @@ const ML_STATE = { locked: ['bad', '全池锁定'], starved: ['warn', '此刻无
 function renderModelLocks(rows) {
   const tb = $('mlBody');
   const list = Array.isArray(rows) ? rows : [];
+  LAST.ml = list;
+  const pageRows = pgApply('mlBody', 'ml', list);
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="7" style="color:var(--ink-3)">没有模型处于锁定/限流</td></tr>';
     $('mlNote').textContent = '';
     return;
   }
   const now = Date.now();
-  tb.innerHTML = list.map(r => {
+  tb.innerHTML = pageRows.map(r => {
     const [cls, label] = ML_STATE[r.state] || ['mute', r.state];
     return '<tr><td class="num">' + esc(r.model) + '</td>' +
       '<td><span class="tag ' + cls + '">' + esc(label) + '</span></td>' +
@@ -450,13 +735,15 @@ function renderModelLocks(rows) {
 function renderDeadModels(rows) {
   const tb = $('dmBody');
   const list = Array.isArray(rows) ? rows : [];
+  LAST.dm = list;
+  const pageRows = pgApply('dmBody', 'dm', list);
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="6" style="color:var(--ink-3)">没有模型被判失效</td></tr>';
     $('dmNote').textContent = '';
     return;
   }
   const now = Date.now();
-  tb.innerHTML = list.map(r => {
+  tb.innerHTML = pageRows.map(r => {
     const left = (Number(r.until) * 1000 - now) / 1000;
     return '<tr><td class="num">' + esc(r.model) + '</td>' +
       '<td class="num">' + (r.hits || 0) + '</td>' +
@@ -481,30 +768,22 @@ function renderDeadModels(rows) {
 // renderExpiry 积分到期提醒（参考面板同区块）：Loomy 只有「每日赠送」会随周期失效，
 // 长期积分不到期。到期日 = daily_cycle_date 的次日 00:00；同一天的多个账号合并成一行。
 function renderExpiry(accounts) {
+  // 原独立表格已并入账号池（「到期」列 + 「有到期积分」筛选），这里只保留一行汇总：
+  // 同一批数据不再渲染两遍（136 个账号时那是 133 行重复）。
   const rows = [];
   for (const a of (accounts || [])) {
-    const bal = Number(a.daily_balance || 0);
-    if (!bal || !a.daily_cycle_date) continue;
-    const cyc = new Date(a.daily_cycle_date + 'T00:00:00');
-    if (isNaN(cyc.getTime())) continue;
-    const exp = new Date(cyc.getTime() + 86400000);
-    const days = Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000));
-    rows.push({ name: a.name, exp, days, remain: bal });
+    const d = accDue(a);
+    if (d) rows.push({ days: d.days, remain: d.remain, exp: d.exp });
   }
+  const note = $('expNote');
+  if (!note) return;
+  if (!rows.length) { note.textContent = ''; return; }
   rows.sort((x, y) => x.exp - y.exp);
-  const tb = $('expBody');
-  if (!tb) return;
-  tb.innerHTML = !rows.length
-    ? '<tr><td colspan="5"><div class="empty">暂无未来到期批次（长期积分不到期，每日额度为 0 时不入表）</div></td></tr>'
-    : rows.map(r => '<tr><td class="who"><div class="nm">' + esc(r.name) + '</div></td>' +
-        '<td>' + r.exp.toLocaleDateString('zh-CN') + '</td>' +
-        '<td class="num">' + (r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天') + '</td>' +
-        '<td class="num">' + fmtPoints(r.remain) + '</td>' +
-        '<td class="num">' + fmtPoints(Math.ceil(r.remain / Math.max(1, r.days))) + '</td></tr>').join('');
-  const total = rows.reduce((s, r) => s + r.remain, 0);
-  if ($('expNote')) $('expNote').textContent = rows.length ? rows.length + ' 个账号 · 合计 ' + fmtPoints(total) : '—';
+  const total = rows.reduce((n, r) => n + r.remain, 0);
+  const soon = rows.filter(r => r.days <= 1).length;
+  note.textContent = rows.length + ' 个账号有每日余额 · 合计 ' + fmtPoints(total) +
+    (soon ? ' · ' + soon + ' 个 1 天内到期' : '');
 }
-
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -732,10 +1011,12 @@ function mdRowHtml(m) {
 function renderModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  pgSig('md', JSON.stringify(mdFilter));
+  const pageRows = pgApply('mdBody', 'md', list);
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
   } else {
-    tb.innerHTML = list.map(mdRowHtml).join('');
+    tb.innerHTML = pageRows.map(mdRowHtml).join('');
   }
   // 限免数单独报出来：这是「现在用哪个模型不花积分」的直接答案。
   const freeCount = mdAll.filter(m => m.is_free).length;
@@ -793,35 +1074,69 @@ async function loadLogs() {
   // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
   const rq = trangeQuery('reqRange', false);
   rq.set('limit', limit);
-  try {
-    const [d, requestRows, errSum, credit] = await Promise.all([
-      api('logs'),
-      api('requests?' + rq.toString()).catch(() => ({ records: [] })),
-      api('error_summary').catch(() => null),
-      api('credit_history?limit=' + creditLimitValue()).catch(() => null),
-    ]);
-    renderRequests(requestRows.records || []);
-    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
-    box.innerHTML = entries.length
-      ? entries.map(e => {
-        const lvl = logLevel(e.text);
-        const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
-        return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
-      }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
-    if (logPin && atEnd) box.scrollTop = box.scrollHeight;
-    const counts = {};
-    for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
-    $('logNote').textContent = logCh === 'all'
-      ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
-    renderErrorSummary(errSum);
-    renderCreditHistory(credit);
-  } catch (e) { /* 概览已提示 */ }
+
+  const withTimeout = (p, ms, label) => Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' 超时 ' + ms + 'ms')), ms)),
+  ]);
+
+  // 四块数据互不相干，**谁回来先渲染谁**。积分流水冷启动要全池打一遍上游（实测 5s），
+  // 串在一起等它的结果是：请求记录/错误汇总明明 50ms 就拿到了，却要陪着等 5 秒，
+  // 看起来就像这两张表没数据。
+  renderLogBox(null, box, atEnd);  // 先占位，避免上一轮的旧内容误导
+  await Promise.allSettled([
+    withTimeout(api('logs'), 8000, '日志')
+      .then(d => renderLogBox(d || { entries: [] }, box, atEnd))
+      .catch(e => {
+        console.error('loadLogs/logs 失败', e);
+        renderLogBox({ entries: [], failed: true }, box, atEnd);
+      }),
+    withTimeout(api('requests?' + rq.toString()), 20000, '请求记录')
+      .then(r => renderRequests((r && r.records) || []))
+      .catch(e => {
+        console.error('loadLogs/requests 失败', e);
+        const note = $('reqNote');
+        if (note) {
+          note.textContent = '请求记录读取失败：' + (e && e.message || e) + '（点「刷新」重试）';
+          note.className = 'note src-off';
+        }
+      }),
+    withTimeout(api('error_summary'), 20000, '错误汇总')
+      .then(v => renderErrorSummary(v))
+      .catch(e => console.error('loadLogs/errors 失败', e)),
+    withTimeout(api('credit_history?limit=' + creditLimitValue()), 20000, '积分流水')
+      .then(v => renderCreditHistory(v))
+      .catch(e => console.error('loadLogs/credit 失败', e)),
+  ]);
 }
 
-// reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
+// renderLogBox 渲染控制台日志区。d 为 null 时只清空（占位用）。
+function renderLogBox(d, box, atEnd) {
+  if (!box) return;
+  if (!d) {
+    // 每轮轮询都会先走一次占位；已经有内容时不要覆盖，否则每 5 秒闪一下「读取中…」。
+    if (!box.textContent.trim()) box.innerHTML = '<span style="color:var(--ink-3)">读取中…</span>';
+    return;
+  }
+  const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
+  box.innerHTML = entries.length
+    ? entries.map(e => {
+      const lvl = logLevel(e.text);
+      const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+      const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
+      return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
+    }).join('')
+    : '<span style="color:var(--ink-3)">' + (d.failed ? '日志读取失败（见控制台）' : '暂无日志') + '</span>';
+  if (logPin && atEnd) box.scrollTop = box.scrollHeight;
+  const counts = {};
+  for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
+  const note = $('logNote');
+  if (note) {
+    note.textContent = logCh === 'all'
+      ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
+      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+  }
+}// reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
 // outcome 精确匹配。两者都在已拉取的条目上做（最多 2000 条），不发新请求。
 function reqMatch(e, f) {
   f = f || reqFilter;
@@ -862,9 +1177,12 @@ function reqToolCell(e) {
   return called ? text : '<span class="tag warn" title="声明了工具但一次没调用">' + text + '</span>';
 }
 function renderRequestTable() {
-  const list = reqEntries.filter(e => reqMatch(e));
+  const list = sortApply('req', reqEntries.filter(e => reqMatch(e)), REQ_GET, 'time', -1);
+  pgSig('req', JSON.stringify(reqFilter));
+  const pageRows = pgApply('reqBody', 'req', list);
+  sortMark('reqBody', 'req');
   const tb = $('reqBody');
-  tb.innerHTML = list.map(e => {
+  tb.innerHTML = pageRows.map(e => {
     const when = e && e.t ? new Date(e.t * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.ip ? e.ip : '';
     const ua = e && e.ua ? e.ua : '';
@@ -915,7 +1233,9 @@ function renderRequests(records) {
 /* 错误汇总（后端 /panel/api/error_summary 已聚合+排序）：只渲染，不在这里再算。 */
 function renderErrorSummary(d) {
   const rows = (d && d.errors) || [];
-  $('errBody').innerHTML = rows.length ? rows.map(r => {
+  LAST.err = d;
+  const pageRows = pgApply('errBody', 'err', rows);
+  $('errBody').innerHTML = pageRows.length ? pageRows.map(r => {
     const sev = r.status >= 500 ? 'lv-e' : r.status === 429 ? 'lv-w' : '';
     return '<tr class="' + sev + '">' +
       '<td>' + esc(r.account || '—') + '</td>' +
@@ -962,14 +1282,18 @@ function creditHistoryNote(entries) {
 function renderCreditHistory(d) {
   const body = $('creditBody'), note = $('creditNote');
   if (!d) {
+    // 早退也要清分页条：否则会留下「表里 1 行、分页条说 100 条」的错位。
+    pgApply('creditBody', 'credit', []);
     note.textContent = '积分历史不可用';
     body.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">积分历史不可用</td></tr>';
     return;
   }
   const entries = d.entries || [];
+  LAST.credit = d;
+  const pageRows = pgApply('creditBody', 'credit', entries);
   note.textContent = creditHistoryNote(entries);
   body.innerHTML = entries.length
-    ? entries.map(e => '<tr title="' + esc(creditEntryText(e)) + '">' +
+    ? pageRows.map(e => '<tr title="' + esc(creditEntryText(e)) + '">' +
       '<td>' + esc(creditTimeText(e)) + '</td>' +
       '<td>' + esc(e.account || '—') + '</td>' +
       '<td class="num">' + esc(creditDeltaText(e.delta)) + '</td>' +
@@ -1003,6 +1327,7 @@ $('btnReqReload').onclick = loadLogs;
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
 trangeBind('reqRange', loadLogs, '0');
+$('accFilter').onchange = () => { accFilter = $('accFilter').value; PG.acc.page = 0; renderAccounts(LAST.acc || []); };
 $('creditLimit').onchange = loadCreditHistory;
 $('btnCreditReload').onclick = loadCreditHistory;
 
@@ -1382,8 +1707,10 @@ function renderUsage(d) {
 // renderHourlyTable 积分与 token 按小时（蓝本 usHourBody 表位的 Loomy 实现）。
 function renderHourlyTable(hourly) {
   const rows = (hourly || []).filter(h => (h.requests || 0) > 0 || (h.tokens || 0) > 0);
+  LAST.hour = hourly;
+  const pageRows = pgApply('usHourBody', 'usHour', rows);
   const tb = $('usHourBody');
-  tb.innerHTML = rows.length ? rows.map(h => {
+  tb.innerHTML = pageRows.length ? pageRows.map(h => {
     const tok = Number(h.tokens || 0);
     return '<tr>' +
       '<td class="num">' + esc(h.hour || '') + '</td>' +
@@ -1434,12 +1761,14 @@ function renderUsageDim() {
   const d = usageData || {};
   const m = US_DIMS[usDim] || US_DIMS.account;
   const rows = usSortRows(d[m.key] || [], usSort);
+  pgSig('usDim', usDim + '|' + usSort);
+  const pageRows = pgApply('usDimBody', 'usDim', rows);
   $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x =>
+  $('usDimBody').innerHTML = pageRows.map(x =>
     '<tr><td class="mark" aria-hidden="true"></td>' +
     '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
     '<td class="num">' + fmtTok(x.requests) + '</td>' +
@@ -1466,6 +1795,8 @@ function renderCreditDim() {
   const d = usageData || {};
   const dimKey = usCreditDim === 'model' ? 'by_model' : 'by_account';
   const rows = (d[dimKey] || []).filter(x => Number(x.points || 0) > 0);
+  pgSig('usCredit', usCreditDim);
+  const pageRows = pgApply('usCreditBody', 'usCredit', rows);
   const tokSum = rows.reduce((n, x) => n + Number(x.total_tokens || 0), 0);
   const ptSum = rows.reduce((n, x) => n + Number(x.points || 0), 0);
   $('usCreditStats').innerHTML =
@@ -1475,7 +1806,7 @@ function renderCreditDim() {
     usKpi(String(rows.length), '有扣费口径', 'c-mute', usCreditDim === 'model' ? '个模型' : '个账号');
   $('usCreditHead').innerHTML = '<tr><th class="mark" aria-hidden="true"></th><th>' +
     (usCreditDim === 'model' ? '模型' : '账号') + '</th><th class="num">请求</th><th class="num">扣除积分</th><th class="num">Token</th><th class="num">积分 / 1M Token</th></tr>';
-  $('usCreditBody').innerHTML = rows.map(x =>
+  $('usCreditBody').innerHTML = pageRows.map(x =>
     '<tr><td class="mark" aria-hidden="true"></td>' +
     '<td>' + remarkName(x.key, esc(x.key || '—')) + '</td>' +
     '<td class="num">' + fmtTok(x.requests) + '</td>' +
@@ -1877,7 +2208,7 @@ function renderPackages(d) {
   renderExpiryDistribution(list, now);
   if (!list.length) {
     $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
-    $('pkDetail').innerHTML = '';
+    $('pkdBody').innerHTML = '<tr><td colspan="8" class="empty">查询中…（逐账号向上游实时查询）</td></tr>';
     return;
   }
   const names = [];
@@ -1894,7 +2225,9 @@ function renderPackages(d) {
   const colorOf = n => pkColor(names.indexOf(n));
   const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
 
-  $('pkSummary').innerHTML = list.map(a => {
+  // 136 张卡片一次性进 DOM 是这页 7k 元素的主因，按页渲染。
+  const pkPage = pgApply('pkSummary', 'pk', list);
+  $('pkSummary').innerHTML = pkPage.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' + esc(a.nickname || a.uid) + '</span></div>' +
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
@@ -1924,32 +2257,32 @@ function renderPackages(d) {
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  $('pkDetail').innerHTML = list.map(a => {
-    if (a.error) return '';
-    const groups = pkDetailGroups(a.packages || []);
-    const rowOf = p => {
-      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
-      return '<tr><td class="mark" aria-hidden="true"><i style="background:' + colorOf(k) + '"></i></td>' +
-        '<td>' + esc(p.name || '(未命名)') + '<div class="note">' + esc(p.package_code || '') + '</div></td>' +
-        '<td class="num">' + fmtPoints(p.size) + '</td>' +
-        '<td class="num">' + fmtPoints(p.remain) + '</td>' +
-        '<td class="num">' + fmtPoints(p.used) + '</td>' +
-        '<td class="num">' + esc(String(p.created_at || '').slice(0, 16) || '—') + '</td>' +
-        '<td class="num">' + esc(String(p.end_time || '').slice(0, 10) || '不到期') + '</td></tr>';
-    };
-    const usedNote = groups.used.length
-      ? '<tr class="pk-group-summary"><td colspan="7">已入账来源 ' + groups.used.length + ' 项（面额合计 ' + fmtPoints(groups.usedSize) + '，余额已并入上方口径，不重复计数）</td></tr>' +
-        groups.used.map(rowOf).join('')
-      : '';
-    return '<div class="box"><header><h3>' + remarkName(a.uid, esc(a.nickname || a.uid)) + '</h3><span class="grow"></span>' +
-      '<span class="note">可用 ' + fmtPoints(a.remain) + ' / 历史总额 ' + fmtPoints(a.size) +
-      ' · 每日 ' + esc(a.daily_cycle_date || '—') + '</span></header>' +
-      '<div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>口径 / 来源</th>' +
-      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">发放</th><th class="num">到期</th>' +
-      '</tr></thead><tbody>' + groups.active.map(rowOf).join('') + usedNote + '</tbody></table></div></div>';
-  }).join('');
+  // 明细原来是「每个账号一个 box + 一张表」：136 个账号 = 135 个 box / 273 行，
+  // 单这一块就让页面变成 7k 元素、28 屏。改成一张扁平表 + 分页。
+  const detailRows = [];
+  for (const a of list) {
+    if (a.error) { detailRows.push({ acc: a.nickname || a.uid, err: a.error }); continue; }
+    for (const p of (a.packages || [])) detailRows.push({ acc: a.nickname || a.uid, p: p });
+  }
+  const pageDetail = pgApply('pkdBody', 'pkd', detailRows);
+  $('pkdBody').innerHTML = pageDetail.map(r => {
+    if (r.err) {
+      return '<tr><td class="mark" aria-hidden="true"></td><td>' + esc(r.acc) + '</td>' +
+        '<td colspan="6" class="empty">查询失败：' + esc(r.err) + '</td></tr>';
+    }
+    const p = r.p;
+    const key = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    return '<tr><td class="mark" aria-hidden="true"><i style="background:' + colorOf(key) + '"></i></td>' +
+      '<td>' + remarkName(r.acc, esc(r.acc)) + '</td>' +
+      '<td>' + esc(p.name || '(未命名)') + '<div class="note">' + esc(p.package_code || '') + '</div></td>' +
+      '<td class="num">' + fmtPoints(p.size) + '</td>' +
+      '<td class="num">' + (p.remain == null ? '—' : fmtPoints(p.remain)) + '</td>' +
+      '<td class="num">' + (p.used == null ? '—' : fmtPoints(p.used)) + '</td>' +
+      '<td class="num">' + esc(String(p.created_at || '').slice(0, 16) || '—') + '</td>' +
+      '<td class="num">' + esc(String(p.end_time || '').slice(0, 10) || '不到期') + '</td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">没有口径数据</td></tr>';
+  const pkdNote = $('pkdNote');
+  if (pkdNote) pkdNote.textContent = detailRows.length + ' 个口径 · ' + list.length + ' 个账号';
 }
 
 // 按需拉取（蓝本 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
@@ -1965,10 +2298,11 @@ async function loadPackages(force) {
     return;
   }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('pkDetail').innerHTML = '';
+  $('pkdBody').innerHTML = '<tr><td colspan="8" class="empty">查询中…（逐账号向上游实时查询）</td></tr>';
   $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
   try {
-    const d = await api('packages');
+    // 刷新按钮显式绕过服务端 120s 缓存（缓存让二次打开从 15s 降到毫秒级）
+    const d = await api('packages' + (force ? '?force=1' : ''));
     lastPackages = d;
     lastPackagesAt = Date.now();
     renderPackages(d);
@@ -2083,3 +2417,20 @@ $('btnRemarkClear').onclick = async () => {
   else toast('已清除全部备注', 'ok');
 };
 $('btnRemarkSave').onclick = saveRemarkForm;
+
+
+/* ── 分页重渲染登记：换页 / 改每页条数时，各列表从缓存数据重画当前页 ── */
+PG_RENDER.acc = () => renderAccounts(LAST.acc || []);
+PG_RENDER.exp = () => renderExpiry(LAST.acc || []);
+PG_RENDER.ml = () => renderModelLocks(LAST.ml || []);
+PG_RENDER.dm = () => renderDeadModels(LAST.dm || []);
+PG_RENDER.md = () => renderModels();
+PG_RENDER.req = () => renderRequestTable();
+PG_RENDER.err = () => renderErrorSummary(LAST.err);
+PG_RENDER.credit = () => renderCreditHistory(LAST.credit);
+PG_RENDER.usHour = () => renderHourlyTable(LAST.hour || []);
+PG_RENDER.usDim = () => renderUsageDim();
+PG_RENDER.usCredit = () => renderCreditDim();
+// 积分构成：卡片网格与明细表共用同一份数据（lastPackages），换页时重画即可。
+PG_RENDER.pk = () => { if (lastPackages) renderPackages(lastPackages); };
+PG_RENDER.pkd = () => { if (lastPackages) renderPackages(lastPackages); };
