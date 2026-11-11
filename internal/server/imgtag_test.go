@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// testTagAllow 只在测试里模拟「白名单命中」的旧行为。
+var testTagAllow = []string{"deepseek-v4-flash-0731"}
+
 // bodyOf 从 JSON 字面量取 body，省掉手搓嵌套 map 的噪音。
 func bodyOf(t *testing.T, raw string) map[string]any {
 	t.Helper()
@@ -27,12 +30,12 @@ func contentOf(t *testing.T, body map[string]any) []any {
 	return parts
 }
 
-// deepseek 系：data URI 图片块被并进前一个文本块，图片块本身消失。
+// 白名单命中（旧行为）：data URI 图片块被并进前一个文本块，图片块本身消失。
 func TestRewriteImageTagsForDeepSeek(t *testing.T) {
 	body := bodyOf(t, `{"messages":[{"role":"user","content":[
 		{"type":"text","text":"这张图是什么"},
 		{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}`)
-	if n := rewriteImageTags(body, "deepseek-v4-flash-0731"); n != 1 {
+	if n := rewriteImageTags(body, "deepseek-v4-flash-0731", testTagAllow); n != 1 {
 		t.Fatalf("转换数 = %d，期望 1", n)
 	}
 	parts := contentOf(t, body)
@@ -45,13 +48,13 @@ func TestRewriteImageTagsForDeepSeek(t *testing.T) {
 	}
 }
 
-// GLM 系：保持 image_url 原样（转了反而看不见图）。
+// 不在白名单：保持 image_url 原样（转了反而看不见图）。
 func TestRewriteImageTagsSkipsNonDeepSeek(t *testing.T) {
 	raw := `{"messages":[{"role":"user","content":[
 		{"type":"text","text":"看图"},
 		{"type":"image_url","image_url":{"url":"data:image/png;base64,BBB"}}]}]}`
 	body := bodyOf(t, raw)
-	if n := rewriteImageTags(body, "GLM-5.3-Flash"); n != 0 {
+	if n := rewriteImageTags(body, "GLM-5.3-Flash", testTagAllow); n != 0 {
 		t.Fatalf("非 deepseek 模型不该转换，实际 %d", n)
 	}
 	parts := contentOf(t, body)
@@ -64,7 +67,7 @@ func TestRewriteImageTagsSkipsNonDeepSeek(t *testing.T) {
 func TestRewriteImageTagsSkipsURLImages(t *testing.T) {
 	body := bodyOf(t, `{"messages":[{"role":"user","content":[
 		{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`)
-	if n := rewriteImageTags(body, "deepseek-v4.1-flash"); n != 0 {
+	if n := rewriteImageTags(body, "deepseek-v4-flash-0731", testTagAllow); n != 0 {
 		t.Fatalf("URL 图片不该转换，实际 %d", n)
 	}
 }
@@ -73,7 +76,7 @@ func TestRewriteImageTagsSkipsURLImages(t *testing.T) {
 func TestRewriteImageTagsSoloImage(t *testing.T) {
 	body := bodyOf(t, `{"messages":[{"role":"user","content":[
 		{"type":"image_url","image_url":"data:image/jpeg;base64,CCC"}]}]}`)
-	if n := rewriteImageTags(body, "deepseek-v4-flash-0731"); n != 1 {
+	if n := rewriteImageTags(body, "deepseek-v4-flash-0731", testTagAllow); n != 1 {
 		t.Fatalf("转换数 = %d，期望 1", n)
 	}
 	parts := contentOf(t, body)
@@ -85,11 +88,29 @@ func TestRewriteImageTagsSoloImage(t *testing.T) {
 // 纯文本请求（绝大多数）：一个字都不改。
 func TestRewriteImageTagsNoImages(t *testing.T) {
 	body := bodyOf(t, `{"messages":[{"role":"user","content":"你好"}]}`)
-	if n := rewriteImageTags(body, "deepseek-v4-flash-0731"); n != 0 {
+	if n := rewriteImageTags(body, "deepseek-v4-flash-0731", testTagAllow); n != 0 {
 		t.Fatalf("纯文本不该转换，实际 %d", n)
 	}
 	parts := body["messages"].([]any)[0].(map[string]any)["content"]
 	if str(parts) != "你好" {
 		t.Errorf("纯文本内容被改写: %v", parts)
+	}
+}
+
+// 默认白名单为空：任何模型（含 deepseek 系）都不转标记，data URI 原样透传。
+//
+// 这是 2026-11-11 的回归点：上游换代成 DeepSeek-V4.1-Flash 后不认 <image_base64> 标记，
+// 旧的「名字含 deepseek 就转」通配会把能看图的模型打成看不见图（实测 109381 token 的
+// 纯文本 vs 246 token 的正常视觉编码）。
+func TestRewriteImageTagsDefaultAllowlistIsEmpty(t *testing.T) {
+	body := bodyOf(t, `{"messages":[{"role":"user","content":[
+		{"type":"text","text":"这张图是什么"},
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,DDD"}}]}]}`)
+	if n := rewriteImageTags(body, "DeepSeek-V4.1-Flash", nil); n != 0 {
+		t.Fatalf("白名单为空时不该转换，实际 %d", n)
+	}
+	parts := contentOf(t, body)
+	if len(parts) != 2 || str(parts[1].(map[string]any)["type"]) != "image_url" {
+		t.Errorf("图片块应原样保留: %v", parts)
 	}
 }
