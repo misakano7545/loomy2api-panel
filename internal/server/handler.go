@@ -1093,8 +1093,9 @@ func (h *Handler) resolveModel(ctx context.Context, payload map[string]any) stri
 	}
 	if payload != nil {
 		payload["model"] = model
-		// deepseek 系只认 <image_base64> 标记，其余认 image_url（见 imgtag.go 的实测依据）。
-		rewriteImageTags(payload, model)
+		// 只有 image_tag_models 白名单里的模型才转 <image_base64> 标记，其余透传 image_url
+		// （见 imgtag.go 的实测依据）。
+		rewriteImageTags(payload, model, h.Cfg.ImageTagModels)
 		liftMaxTokens(payload)
 	}
 	return model

@@ -1054,35 +1054,49 @@ func TestStrictCheckOffAllowsUnknown(t *testing.T) {
 	}
 }
 
-// TestChatImageTagRewriteReachesUpstream 按模型分派图片形态必须在真实请求链路上生效
+// TestChatImageTagRewriteReachesUpstream 图片形态的按模型分派必须在真实请求链路上生效
 // （imgtag_test 只覆盖函数本身，这里是接线检查：resolveModel 是唯一收口处）。
+//
+// 2026-11-11 语义变更：旧实现是「模型名含 deepseek 就转 <image_base64> 标记」的通配，
+// 上游换代成 DeepSeek-V4.1-Flash 后不认该标记（图被当纯文本内联，实测 109381 token），
+// 现改为 `h.Cfg.ImageTagModels` 显式白名单、默认空 = 一律透传标准 image_url。
+// 第三条用例就是这次回归的护栏：**默认配置下 DeepSeek-V4.1-Flash 绝不能被转成标记**。
 func TestChatImageTagRewriteReachesUpstream(t *testing.T) {
 	const img = `{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}`
 	for _, tc := range []struct {
+		name    string
 		model   string
+		allow   []string
 		wantTag bool
 	}{
-		{"imodel/deepseek-v4-flash-0731", true},
-		{"imodel/GLM-5.3-Flash", false},
+		{"白名单命中：转为标记", "imodel/deepseek-v4-flash-0731", []string{"deepseek-v4-flash-0731"}, true},
+		{"白名单未命中：透传 image_url", "imodel/DeepSeek-V4.1-Flash", []string{"deepseek-v4-flash-0731"}, false},
+		{"默认空白名单：DeepSeek-V4.1-Flash 必须透传（本次回归）", "imodel/DeepSeek-V4.1-Flash", nil, false},
+		{"默认空白名单：GLM 透传", "imodel/GLM-5.3-Flash", nil, false},
 	} {
 		fs := newFakeUpstream(t, jsonHandler(200,
 			`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}`))
 		h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+		h.Cfg.ImageTagModels = tc.allow
 		body := `{"model":"` + tc.model + `","messages":[{"role":"user","content":[` +
 			`{"type":"text","text":"看图"},` + img + `]}],"max_tokens":10}`
 		w := httptest.NewRecorder()
 		h.Routes().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
 		if w.Code != http.StatusOK {
-			t.Fatalf("%s: 状态码 %d：%s", tc.model, w.Code, w.Body.String())
+			t.Fatalf("%s: 状态码 %d：%s", tc.name, w.Code, w.Body.String())
 		}
 		if len(fs.bodies) == 0 {
-			t.Fatalf("%s: 上游没收到请求", tc.model)
+			t.Fatalf("%s: 上游没收到请求", tc.name)
 		}
 		// 上游收到的是 JSON 序列化后的文本：Go 会把 < > 转义成 \u003c/\u003e，
 		// 网关按 JSON 解析后仍是 <image_base64>…</image_base64>。
-		got := strings.Contains(fs.bodies[0], `\u003cimage_base64\u003eAAA\u003c/image_base64\u003e`)
-		if got != tc.wantTag {
-			t.Errorf("%s: 上游收到 %s（标记=%v，期望 %v）", tc.model, fs.bodies[0], got, tc.wantTag)
+		gotTag := strings.Contains(fs.bodies[0], `\u003cimage_base64\u003eAAA\u003c/image_base64\u003e`)
+		if gotTag != tc.wantTag {
+			t.Errorf("%s: 标记=%v，期望 %v；上游收到 %s", tc.name, gotTag, tc.wantTag, fs.bodies[0])
+		}
+		// 反向断言：透传时上游必须真的收到 image_url 块（不是被丢掉、也不是被压成文本）。
+		if !tc.wantTag && !strings.Contains(fs.bodies[0], `"image_url"`) {
+			t.Errorf("%s: 未转标记时上游应收到 image_url 块，实际 %s", tc.name, fs.bodies[0])
 		}
 	}
 }

@@ -82,6 +82,9 @@ func (m Model) IsImage() bool { return strings.EqualFold(m.Type, "image") }
 type Config struct {
 	Listen    string   `json:"listen"`
 	APIKeys   []string `json:"api_keys"` // 空 = 不鉴权；面板登录也用这把
+	// ImageTagModels 需要把 data URI 图片转成 <image_base64> 标记的模型（子串匹配）。
+	// 默认空 = 一律透传标准 image_url；详见 internal/server/imgtag.go 的实测依据。
+	ImageTagModels []string `json:"image_tag_models"`
 	AuthDir   string   `json:"auth_dir"`
 	StateFile string   `json:"state_file"`
 	LogDir    string   `json:"log_dir"`
