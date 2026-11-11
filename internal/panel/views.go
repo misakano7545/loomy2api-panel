@@ -97,7 +97,21 @@ func creditPackagesFromRecords(recs []map[string]any) []map[string]any {
 
 // packagesHandler 全池积分构成快照。逐号实时查上游（并发 ≤3，蓝本同构），
 // 失败只标在该号上。
+// pkCacheTTL 积分构成的缓存时长。该接口是面板里最贵的一个（O(账号数) × 3 次上游），
+// 而积分口径变化很慢，120 秒足够新鲜。
+const pkCacheTTL = 120 * time.Second
+
 func (p *Panel) packagesHandler(w http.ResponseWriter, r *http.Request) {
+	// ?force=1 绕缓存（面板上的「刷新」按钮走这条）。
+	if r.URL.Query().Get("force") == "" {
+		p.pkMu.Lock()
+		cached, at := p.pkCache, p.pkAt
+		p.pkMu.Unlock()
+		if cached != nil && time.Since(at) < pkCacheTTL {
+			writeJSON(w, http.StatusOK, cached)
+			return
+		}
+	}
 	accounts := p.pool.All()
 	type acctRow struct {
 		UID             string           `json:"uid"`
@@ -112,7 +126,8 @@ func (p *Panel) packagesHandler(w http.ResponseWriter, r *http.Request) {
 		Error           string           `json:"error,omitempty"`
 	}
 	out := make([]acctRow, len(accounts))
-	sem := make(chan struct{}, 3)
+	// 并发 8：实测单账号约 0.33s（3 个上游串行），3 并发时 136 账号要 15s。
+	sem := make(chan struct{}, 8)
 	var wg sync.WaitGroup
 	for i, a := range accounts {
 		wg.Add(1)
@@ -135,7 +150,6 @@ func (p *Panel) packagesHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			a.SetQuota(q)
-			p.persist(a)
 			row.Packages = quotaPackages(q)
 			if obj, err := p.upstream.Points(ctx, a.Session, 1); err == nil {
 				if recs, ok := obj["records"].([]map[string]any); ok {
@@ -166,8 +180,18 @@ func (p *Panel) packagesHandler(w http.ResponseWriter, r *http.Request) {
 		}(i, a)
 	}
 	wg.Wait()
+	// 凭证落盘移出并发段：它只是持久化刚刷新到的额度快照，不该占用并发额度。
+	for _, a := range accounts {
+		if a.SessionValid() {
+			p.persist(a)
+		}
+	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+	payload := map[string]any{"accounts": out}
+	p.pkMu.Lock()
+	p.pkCache, p.pkAt = payload, time.Now()
+	p.pkMu.Unlock()
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // ---------------------------------------------------------------- 积分历史

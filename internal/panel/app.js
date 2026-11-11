@@ -182,7 +182,24 @@ function pgFoot(tbId, key, total, st) {
   const tb = $(tbId);
   if (!tb) return;
   const table = tb.closest('table');
-  if (!table) return;
+  if (!table) {
+    // 非表格容器（积分构成的卡片网格）：分页条直接挂在容器后面。
+    const id = 'pg-' + key;
+    let bar = document.getElementById(id);
+    if (total <= st.size) {
+      if (bar && bar.parentElement) bar.parentElement.removeChild(bar);
+      return;
+    }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = id;
+      bar.className = 'pgf';
+      bar.setAttribute('data-pgkey', key);
+      tb.parentElement.insertBefore(bar, tb.nextSibling);
+    }
+    bar.innerHTML = pgHtml(key, total, st);
+    return;
+  }
   // 找到最近的横向滚动容器（.tbl-wrap）；有就挂到它外面。
   let host = table;
   const wrap = table.parentElement;
@@ -2191,7 +2208,7 @@ function renderPackages(d) {
   renderExpiryDistribution(list, now);
   if (!list.length) {
     $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
-    $('pkDetail').innerHTML = '';
+    $('pkdBody').innerHTML = '<tr><td colspan="8" class="empty">查询中…（逐账号向上游实时查询）</td></tr>';
     return;
   }
   const names = [];
@@ -2208,7 +2225,9 @@ function renderPackages(d) {
   const colorOf = n => pkColor(names.indexOf(n));
   const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
 
-  $('pkSummary').innerHTML = list.map(a => {
+  // 136 张卡片一次性进 DOM 是这页 7k 元素的主因，按页渲染。
+  const pkPage = pgApply('pkSummary', 'pk', list);
+  $('pkSummary').innerHTML = pkPage.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' + esc(a.nickname || a.uid) + '</span></div>' +
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
@@ -2238,32 +2257,32 @@ function renderPackages(d) {
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  $('pkDetail').innerHTML = list.map(a => {
-    if (a.error) return '';
-    const groups = pkDetailGroups(a.packages || []);
-    const rowOf = p => {
-      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
-      return '<tr><td class="mark" aria-hidden="true"><i style="background:' + colorOf(k) + '"></i></td>' +
-        '<td>' + esc(p.name || '(未命名)') + '<div class="note">' + esc(p.package_code || '') + '</div></td>' +
-        '<td class="num">' + fmtPoints(p.size) + '</td>' +
-        '<td class="num">' + fmtPoints(p.remain) + '</td>' +
-        '<td class="num">' + fmtPoints(p.used) + '</td>' +
-        '<td class="num">' + esc(String(p.created_at || '').slice(0, 16) || '—') + '</td>' +
-        '<td class="num">' + esc(String(p.end_time || '').slice(0, 10) || '不到期') + '</td></tr>';
-    };
-    const usedNote = groups.used.length
-      ? '<tr class="pk-group-summary"><td colspan="7">已入账来源 ' + groups.used.length + ' 项（面额合计 ' + fmtPoints(groups.usedSize) + '，余额已并入上方口径，不重复计数）</td></tr>' +
-        groups.used.map(rowOf).join('')
-      : '';
-    return '<div class="box"><header><h3>' + remarkName(a.uid, esc(a.nickname || a.uid)) + '</h3><span class="grow"></span>' +
-      '<span class="note">可用 ' + fmtPoints(a.remain) + ' / 历史总额 ' + fmtPoints(a.size) +
-      ' · 每日 ' + esc(a.daily_cycle_date || '—') + '</span></header>' +
-      '<div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>口径 / 来源</th>' +
-      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">发放</th><th class="num">到期</th>' +
-      '</tr></thead><tbody>' + groups.active.map(rowOf).join('') + usedNote + '</tbody></table></div></div>';
-  }).join('');
+  // 明细原来是「每个账号一个 box + 一张表」：136 个账号 = 135 个 box / 273 行，
+  // 单这一块就让页面变成 7k 元素、28 屏。改成一张扁平表 + 分页。
+  const detailRows = [];
+  for (const a of list) {
+    if (a.error) { detailRows.push({ acc: a.nickname || a.uid, err: a.error }); continue; }
+    for (const p of (a.packages || [])) detailRows.push({ acc: a.nickname || a.uid, p: p });
+  }
+  const pageDetail = pgApply('pkdBody', 'pkd', detailRows);
+  $('pkdBody').innerHTML = pageDetail.map(r => {
+    if (r.err) {
+      return '<tr><td class="mark" aria-hidden="true"></td><td>' + esc(r.acc) + '</td>' +
+        '<td colspan="6" class="empty">查询失败：' + esc(r.err) + '</td></tr>';
+    }
+    const p = r.p;
+    const key = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    return '<tr><td class="mark" aria-hidden="true"><i style="background:' + colorOf(key) + '"></i></td>' +
+      '<td>' + remarkName(r.acc, esc(r.acc)) + '</td>' +
+      '<td>' + esc(p.name || '(未命名)') + '<div class="note">' + esc(p.package_code || '') + '</div></td>' +
+      '<td class="num">' + fmtPoints(p.size) + '</td>' +
+      '<td class="num">' + (p.remain == null ? '—' : fmtPoints(p.remain)) + '</td>' +
+      '<td class="num">' + (p.used == null ? '—' : fmtPoints(p.used)) + '</td>' +
+      '<td class="num">' + esc(String(p.created_at || '').slice(0, 16) || '—') + '</td>' +
+      '<td class="num">' + esc(String(p.end_time || '').slice(0, 10) || '不到期') + '</td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">没有口径数据</td></tr>';
+  const pkdNote = $('pkdNote');
+  if (pkdNote) pkdNote.textContent = detailRows.length + ' 个口径 · ' + list.length + ' 个账号';
 }
 
 // 按需拉取（蓝本 8391a05）：packages 是**逐账号实时查上游**，切进本视图就打一次，
@@ -2279,10 +2298,11 @@ async function loadPackages(force) {
     return;
   }
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
-  $('pkDetail').innerHTML = '';
+  $('pkdBody').innerHTML = '<tr><td colspan="8" class="empty">查询中…（逐账号向上游实时查询）</td></tr>';
   $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
   try {
-    const d = await api('packages');
+    // 刷新按钮显式绕过服务端 120s 缓存（缓存让二次打开从 15s 降到毫秒级）
+    const d = await api('packages' + (force ? '?force=1' : ''));
     lastPackages = d;
     lastPackagesAt = Date.now();
     renderPackages(d);
@@ -2411,3 +2431,6 @@ PG_RENDER.credit = () => renderCreditHistory(LAST.credit);
 PG_RENDER.usHour = () => renderHourlyTable(LAST.hour || []);
 PG_RENDER.usDim = () => renderUsageDim();
 PG_RENDER.usCredit = () => renderCreditDim();
+// 积分构成：卡片网格与明细表共用同一份数据（lastPackages），换页时重画即可。
+PG_RENDER.pk = () => { if (lastPackages) renderPackages(lastPackages); };
+PG_RENDER.pkd = () => { if (lastPackages) renderPackages(lastPackages); };

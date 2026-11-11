@@ -887,7 +887,24 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
         </header>
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
       </div>
-      <div id="pkDetail"></div>
+      <div class="box">
+        <header>
+          <h3>积分口径明细 <span class="hint">每个账号的包 / 活动来源 · 已入账来源的余额已并入上方口径，不重复计数</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="pkdNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>账号</th><th>口径 / 来源</th>
+              <th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>
+              <th class="num">发放</th><th class="num">到期</th>
+            </tr></thead>
+            <tbody id="pkdBody"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- 用量 -->
