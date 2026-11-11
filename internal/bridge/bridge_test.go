@@ -494,3 +494,151 @@ func TestResponsesStreamerSequence(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- 图片不许丢（2026-11-11 修）
+//
+// 回归点：responses.go 把 input_image 压成 "[image]"、anthropic.go 不认 image 块，
+// 两条桥接都静默丢图 —— 上游只看到文字，模型回「我看不到图片」，客户端毫不知情。
+
+// 纯文本仍返回字符串（旧行为逐字不变，避免影响绝大多数请求）。
+func TestChatContentTextOnlyStaysString(t *testing.T) {
+	got := ChatContentFromResponses([]any{map[string]any{"type": "input_text", "text": "你好"}})
+	if s, ok := got.(string); !ok || s != "你好" {
+		t.Fatalf("期望字符串 \"你好\"，实际 %#v", got)
+	}
+}
+
+// Responses 的 input_image 必须原样变成 chat 的 image_url，不能被压成 "[image]"。
+func TestResponsesImageIsPreserved(t *testing.T) {
+	const uri = "data:image/png;base64,AAA"
+	got := ChatContentFromResponses([]any{
+		map[string]any{"type": "input_text", "text": "这是什么"},
+		map[string]any{"type": "input_image", "image_url": uri},
+	})
+	parts, ok := got.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("期望 2 个 part，实际 %#v", got)
+	}
+	if str(parts[0].(map[string]any)["type"]) != "text" {
+		t.Errorf("第一个 part 应为 text: %#v", parts[0])
+	}
+	img, _ := parts[1].(map[string]any)
+	if str(img["type"]) != "image_url" {
+		t.Fatalf("第二个 part 应为 image_url: %#v", img)
+	}
+	if u := str(img["image_url"].(map[string]any)["url"]); u != uri {
+		t.Errorf("data URI 被改动: %q", u)
+	}
+}
+
+// Anthropic 的 image 块：base64 与 url 两种 source 都要保住。
+func TestAnthropicImageIsPreserved(t *testing.T) {
+	got := ChatContentFromAnthropic([]any{
+		map[string]any{"type": "text", "text": "看图"},
+		map[string]any{"type": "image", "source": map[string]any{
+			"type": "base64", "media_type": "image/jpeg", "data": "BBB"}},
+	})
+	parts, ok := got.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("期望 2 个 part，实际 %#v", got)
+	}
+	if u := str(parts[1].(map[string]any)["image_url"].(map[string]any)["url"]); u != "data:image/jpeg;base64,BBB" {
+		t.Errorf("base64 source 转错: %q", u)
+	}
+
+	got2 := ChatContentFromAnthropic([]any{
+		map[string]any{"type": "image", "source": map[string]any{"type": "url", "url": "https://x/a.png"}}})
+	parts2, ok := got2.([]any)
+	if !ok || len(parts2) != 1 {
+		t.Fatalf("纯图消息应产生 1 个 part，实际 %#v", got2)
+	}
+	if u := str(parts2[0].(map[string]any)["image_url"].(map[string]any)["url"]); u != "https://x/a.png" {
+		t.Errorf("url source 转错: %q", u)
+	}
+}
+
+// 纯图消息（无文字）不能被整条丢掉。
+func TestAnthropicImageOnlyMessageSurvives(t *testing.T) {
+	req := map[string]any{
+		"model": "DeepSeek-V4.1-Flash",
+		"messages": []any{map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": "image/png", "data": "EEE"}},
+		}}},
+	}
+	msgs, _ := ToOpenAI(req)["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("纯图 user 消息应仍在，实际 %d 条", len(msgs))
+	}
+	parts, ok := msgs[0].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 1 || str(parts[0].(map[string]any)["type"]) != "image_url" {
+		t.Fatalf("纯图消息的图片块丢了: %#v", msgs[0])
+	}
+}
+
+// 端到端：/v1/messages 带图请求，出站 chat 请求必须含 image_url。
+func TestToOpenAIMessageKeepsImage(t *testing.T) {
+	req := map[string]any{
+		"model": "DeepSeek-V4.1-Flash",
+		"messages": []any{map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "看图"},
+			map[string]any{"type": "image", "source": map[string]any{
+				"type": "base64", "media_type": "image/png", "data": "CCC"}},
+		}}},
+	}
+	msgs, _ := ToOpenAI(req)["messages"].([]any)
+	parts, ok := msgs[0].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("出站 content 应含文本+图片两块，实际 %#v", msgs[0].(map[string]any)["content"])
+	}
+	if str(parts[1].(map[string]any)["type"]) != "image_url" {
+		t.Errorf("图片块丢失: %#v", parts)
+	}
+}
+
+// 端到端：/v1/responses 带图请求，出站 chat 请求必须含 image_url。
+func TestResponsesToChatKeepsImage(t *testing.T) {
+	req := map[string]any{
+		"model": "DeepSeek-V4.1-Flash",
+		"input": []any{map[string]any{"type": "message", "role": "user", "content": []any{
+			map[string]any{"type": "input_text", "text": "看图"},
+			map[string]any{"type": "input_image", "image_url": "data:image/png;base64,DDD"},
+		}}},
+	}
+	out, err := ResponsesToChat(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := out["messages"].([]any)
+	parts, ok := msgs[0].(map[string]any)["content"].([]any)
+	if !ok || len(parts) != 2 || str(parts[1].(map[string]any)["type"]) != "image_url" {
+		t.Fatalf("input_image 丢失: %#v", msgs[0])
+	}
+}
+
+// 上游把 assistant 正文放在 content 数组里时不能丢（有的 OpenAI 兼容实现这么返回）。
+func TestChatToResponseAcceptsArrayContent(t *testing.T) {
+	obj := map[string]any{"choices": []any{map[string]any{
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": []any{map[string]any{"type": "text", "text": "你好"}},
+		},
+		"finish_reason": "stop",
+	}}}
+	raw, _ := json.Marshal(ChatToResponse(obj, "m"))
+	if !strings.Contains(string(raw), "你好") {
+		t.Fatalf("数组形态的正文被丢了: %s", raw)
+	}
+}
+
+// 字符串形态必须与旧行为完全一致。
+func TestChatToResponseStringContentUnchanged(t *testing.T) {
+	obj := map[string]any{"choices": []any{map[string]any{
+		"message":       map[string]any{"role": "assistant", "content": "hi"},
+		"finish_reason": "stop",
+	}}}
+	raw, _ := json.Marshal(ChatToResponse(obj, "m"))
+	if !strings.Contains(string(raw), "hi") {
+		t.Fatalf("字符串正文丢失: %s", raw)
+	}
+}

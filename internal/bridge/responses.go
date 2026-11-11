@@ -42,7 +42,8 @@ func ResponsesToChat(req map[string]any) (map[string]any, error) {
 				if role == "developer" {
 					role = "system"
 				}
-				content := ContentToText(item["content"])
+				// 图片必须原样进 content 数组（旧实现压成 "[image]"，图静默丢失）。
+				content := ChatContentFromResponses(item["content"])
 				msg := map[string]any{"role": role, "content": content}
 				if calls, ok := item["tool_calls"].([]any); ok && len(calls) > 0 {
 					msg["tool_calls"] = calls
@@ -69,7 +70,7 @@ func ResponsesToChat(req map[string]any) (map[string]any, error) {
 				messages = append(messages, map[string]any{
 					"role":         "tool",
 					"tool_call_id": str(item["call_id"]),
-					"content":      ContentToText(item["output"]),
+					"content":      ChatContentFromResponses(item["output"]),
 				})
 			}
 		}
@@ -141,35 +142,6 @@ func ResponsesToChat(req map[string]any) (map[string]any, error) {
 	return out, nil
 }
 
-// ContentToText 把 Responses 的 content（字符串或条目数组）压成纯文本。
-func ContentToText(content any) string {
-	switch c := content.(type) {
-	case nil:
-		return ""
-	case string:
-		return c
-	case []any:
-		var parts []string
-		for _, raw := range c {
-			switch item := raw.(type) {
-			case string:
-				parts = append(parts, item)
-			case map[string]any:
-				switch str(item["type"]) {
-				case "input_text", "output_text", "text", "":
-					if t := str(item["text"]); t != "" {
-						parts = append(parts, t)
-					}
-				case "input_image":
-					parts = append(parts, "[image]")
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-	return fmt.Sprint(content)
-}
-
 // ChatToResponse 把非流式 Chat Completion 翻成 Responses 的 response 对象。
 func ChatToResponse(obj map[string]any, model string) map[string]any {
 	choices, _ := obj["choices"].([]any)
@@ -187,7 +159,7 @@ func ChatToResponse(obj map[string]any, model string) map[string]any {
 			"summary": []any{map[string]any{"type": "summary_text", "text": r}},
 		})
 	}
-	if t := str(message["content"]); t != "" {
+	if t := assistantText(message); t != "" {
 		output = append(output, map[string]any{
 			"type":   "message",
 			"id":     "msg_" + account.RandomHex(8),

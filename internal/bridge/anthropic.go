@@ -13,7 +13,10 @@ import (
 	"github.com/misakano7545/loomy2api-panel/internal/account"
 )
 
-// BlocksToText 把 Anthropic 的 content（字符串或块数组）压成纯文本。
+// BlocksToText 把 Anthropic 的 content（字符串或块数组）压成纯文本 —— **只用于 system 之类的纯文本位**。
+//
+// 用户消息的内容一律走 ChatContentFromAnthropic：它会保住 image 块，而这个函数会把图丢掉
+// （2026-11-11 之前 /v1/messages 的图就是这样静默消失的）。
 func BlocksToText(content any) string {
 	switch c := content.(type) {
 	case nil:
@@ -74,7 +77,7 @@ func ToOpenAI(req map[string]any) map[string]any {
 			continue
 		}
 
-		var texts []string
+		cc := &ChatContent{}
 		var toolCalls []any
 		var toolMsgs []any
 		for _, rawBlock := range blocks {
@@ -84,8 +87,11 @@ func ToOpenAI(req map[string]any) map[string]any {
 			}
 			switch str(block["type"]) {
 			case "text":
-				if t := str(block["text"]); t != "" {
-					texts = append(texts, t)
+				cc.AddText(str(block["text"]))
+			case "image":
+				// 旧实现没有这个分支 —— Anthropic 的 image 块被整块丢掉。
+				if u, ok := AnthropicImageURL(block); ok {
+					cc.AddImage(u)
 				}
 			case "tool_use":
 				id := str(block["id"])
@@ -108,16 +114,17 @@ func ToOpenAI(req map[string]any) map[string]any {
 				toolMsgs = append(toolMsgs, map[string]any{
 					"role":         "tool",
 					"tool_call_id": str(block["tool_use_id"]),
-					"content":      BlocksToText(block["content"]),
+					"content":      ChatContentFromAnthropic(block["content"]),
 				})
 			}
 		}
 		// tool_result 块出现在 user 消息里，翻译成独立的 tool 消息，
 		// 且不产生空的 user 脚手架。
-		if len(texts) > 0 || len(toolCalls) > 0 {
+		// 有图也算「有内容」：纯图消息旧实现会整条丢掉。
+		if cc.HasContent() || len(toolCalls) > 0 {
 			out := map[string]any{"role": role}
-			if len(texts) > 0 {
-				out["content"] = strings.Join(texts, "\n")
+			if cc.HasContent() {
+				out["content"] = cc.Value()
 			} else {
 				out["content"] = nil
 			}
