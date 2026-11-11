@@ -185,49 +185,7 @@ func (p *Panel) creditHistoryHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	type entry struct {
-		TS      int64
-		Account string
-		Delta   int64
-		Before  int64
-		After   int64
-		Desc    string
-		Model   string
-		Source  string
-	}
-	var all []entry
-	for _, a := range p.pool.All() {
-		if uid != "" && a.Name != uid {
-			continue
-		}
-		if !a.Enabled || a.Paused || !a.SessionValid() {
-			continue
-		}
-		obj, err := p.upstream.Points(ctx, a.Session, 2)
-		if err != nil {
-			continue
-		}
-		// upstream.Points 已把流水规范成 []map[string]any：time 是字符串秒、
-		// points 恒正数、direction 记借贷向、balance_after 数值。
-		recs, _ := obj["records"].([]map[string]any)
-		for _, m := range recs {
-			delta := i64Any(m["points"])
-			if sAny(m["direction"]) == "debit" {
-				delta = -delta
-			}
-			after := i64Any(m["balance_after"])
-			all = append(all, entry{
-				TS:      i64Any(sAny(m["time"])),
-				Account: a.Name,
-				Delta:   delta,
-				Before:  after - delta,
-				After:   after,
-				Desc:    sAny(m["desc"]),
-				Model:   sAny(m["model"]),
-				Source:  sAny(m["source"]),
-			})
-		}
-	}
+	all := p.creditEntries(ctx, uid)
 	sort.SliceStable(all, func(i, j int) bool { return all[i].TS > all[j].TS })
 	if len(all) > limit {
 		all = all[:limit]
@@ -245,6 +203,109 @@ func (p *Panel) creditHistoryHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "limit": limit})
+}
+
+// creditEntry 一条上游积分流水（多账号合并后的统一形态）。
+type creditEntry struct {
+	TS      int64
+	Account string
+	Delta   int64
+	Before  int64
+	After   int64
+	Desc    string
+	Model   string
+	Source  string
+}
+
+const (
+	// creditCacheTTL 全池流水的缓存时长。上游流水本来就不是实时数据，
+	// 60 秒足够新鲜，而省下的是每 5 秒一次的全账号扫描。
+	creditCacheTTL = 60 * time.Second
+	// creditFetchLimit 同时打上游的账号数上限（并发太高会被上游限流）。
+	creditFetchLimit = 8
+	// creditFetchTime 单个账号的抓取超时；慢账号不该拖住整张表。
+	creditFetchTime = 8 * time.Second
+)
+
+// creditEntries 合并全池积分流水。uid 为空时结果按 creditCacheTTL 缓存：
+// 一次全量拉取是 O(账号数) 次上游请求，是面板里最贵的接口。
+func (p *Panel) creditEntries(ctx context.Context, uid string) []creditEntry {
+	if uid == "" {
+		p.creditMu.Lock()
+		cached, at := p.creditAll, p.creditAt
+		p.creditMu.Unlock()
+		if cached != nil && time.Since(at) < creditCacheTTL {
+			return cached
+		}
+	}
+	all := p.fetchCreditEntries(ctx, uid)
+	if uid == "" && all != nil {
+		p.creditMu.Lock()
+		p.creditAll, p.creditAt = all, time.Now()
+		p.creditMu.Unlock()
+	}
+	return all
+}
+
+// fetchCreditEntries 并发拉取各账号流水，并发上限 creditFetchLimit，
+// 单账号独立超时 creditFetchTime（慢账号跳过，不拖整表）。
+func (p *Panel) fetchCreditEntries(ctx context.Context, uid string) []creditEntry {
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		all []creditEntry
+	)
+	sem := make(chan struct{}, creditFetchLimit)
+	for _, a := range p.pool.All() {
+		if uid != "" && a.Name != uid {
+			continue
+		}
+		if !a.Enabled || a.Paused || !a.SessionValid() {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			c, cancel := context.WithTimeout(ctx, creditFetchTime)
+			defer cancel()
+			obj, err := p.upstream.Points(c, a.Session, 2)
+			if err != nil {
+				return
+			}
+			// upstream.Points 已把流水规范成 []map[string]any：time 是字符串秒、
+			// points 恒正数、direction 记借贷向、balance_after 数值。
+			recs, _ := obj["records"].([]map[string]any)
+			if len(recs) == 0 {
+				return
+			}
+			local := make([]creditEntry, 0, len(recs))
+			for _, m := range recs {
+				delta := i64Any(m["points"])
+				if sAny(m["direction"]) == "debit" {
+					delta = -delta
+				}
+				after := i64Any(m["balance_after"])
+				local = append(local, creditEntry{
+					TS:      i64Any(sAny(m["time"])),
+					Account: a.Name,
+					Delta:   delta,
+					Before:  after - delta,
+					After:   after,
+					Desc:    sAny(m["desc"]),
+					Model:   sAny(m["model"]),
+					Source:  sAny(m["source"]),
+				})
+			}
+			mu.Lock()
+			all = append(all, local...)
+			mu.Unlock()
+		}(a)
+	}
+	wg.Wait()
+	return all
 }
 
 func sAny(v any) string {

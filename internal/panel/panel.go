@@ -47,6 +47,12 @@ type Panel struct {
 	locks   map[string]*sync.Mutex
 
 	started time.Time
+
+	// 积分流水缓存：该接口是 O(账号数) 次上游调用（136 账号串行实测 58s），
+	// 面板 5 秒轮询一次，没有缓存就会持续把上游和面板一起拖住。
+	creditMu  sync.Mutex
+	creditAt  time.Time
+	creditAll []creditEntry
 }
 
 // New 构造面板。

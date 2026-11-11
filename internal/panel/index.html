@@ -643,6 +643,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .ln .c-task { color: var(--accent); }
   .ln .c-chat { color: var(--ok); }
   .ln .c-sys { color: var(--ink-3); }
+
+/* 分页条：账号池 / 请求记录 / 积分流水 / 用量明细等长列表共用 */
+.pgf { border-top: 1px solid var(--line); padding: 8px 12px 10px; }
+.pg { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 12.5px; color: var(--ink-3); }
+.pg-btn { min-width: 28px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface); color: var(--ink-2); cursor: pointer; font-size: 12.5px; line-height: 1.5; }
+.pg-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pg-btn.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.pg-btn:disabled { opacity: .45; cursor: default; }
+.pg-gap { padding: 0 1px; }
+.pg-info { margin-left: auto; white-space: nowrap; }
+.pg-size { width: auto; padding: 3px 6px; font-size: 12.5px; border-radius: 6px; }
+@media (max-width: 560px) {
+  .pg-info { margin-left: 0; order: 9; width: 100%; }
+  .pg-size { margin-left: auto; }
+}
 </style>
 <body>
 <div class="shell">
