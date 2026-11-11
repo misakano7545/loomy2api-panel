@@ -375,6 +375,120 @@ function trangeLabel(id) {
   return f(st.from) + ' → ' + f(st.to);
 }
 
+/* ── 列排序 ────────────────────────────────────────────────────────
+   点表头切换 升序/降序；只有「账号池」和「请求记录」开了表头排序 ——
+   用量/模型目录本来就有自己的排序下拉，再叠一套表头排序只是噪音。 */
+const SORT = {};
+// DESC_FIRST 首次点击按降序排的列（其余按升序）。
+const DESC_FIRST = new Set(['credit', 'ok', 'inflight', 'usage', 'last',
+  'latency', 'tokens', 'points']);
+
+function sortState(key, defField, defDir) {
+  if (!SORT[key]) SORT[key] = { field: defField, dir: defDir };
+  return SORT[key];
+}
+
+// sortApply 按当前排序状态返回新数组（不改原数组）。
+function sortApply(key, rows, getters, defField, defDir) {
+  const st = sortState(key, defField, defDir);
+  const g = getters[st.field] || getters[defField];
+  const out = rows.slice();
+  out.sort((a, b) => {
+    const va = g(a), vb = g(b);
+    if (va === vb) return 0;
+    return (va < vb ? -1 : 1) * st.dir;
+  });
+  return out;
+}
+
+// sortMark 把 ▲/▼ 标在当前排序列上（表头由 render 后统一刷新）。
+function sortMark(tbId, key) {
+  const tb = $(tbId);
+  const table = tb && tb.closest('table');
+  const st = SORT[key];
+  if (!table || !st) return;
+  table.querySelectorAll('th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === st.field;
+    th.classList.toggle('sorted', on);
+    if (on) th.dataset.dir = st.dir > 0 ? 'asc' : 'desc';
+    else th.removeAttribute('data-dir');
+  });
+}
+
+// 表头点击：同列再点切方向，换列则从升序开始，并翻回第一页。
+document.addEventListener('click', ev => {
+  const th = ev.target.closest('th[data-sort]');
+  if (!th) return;
+  const table = th.closest('table');
+  const key = table && table.dataset.sortkey;
+  if (!key) return;
+  const st = sortState(key, th.dataset.sort, 1);
+  const field = th.dataset.sort;
+  if (st.field === field) {
+    st.dir = -st.dir;   // 同一列再点：翻转方向
+  } else {
+    // 数值列首次点击从大到小（积分/耗时/Token 这些「最大的最该先看」）；
+    // 到期要的是「最快过期的先看」，状态要的是「可用的先看」，都用升序。
+    st.field = field;
+    st.dir = DESC_FIRST.has(field) ? -1 : 1;
+  }
+  if (PG[key]) PG[key].page = 0;
+  if (PG_RENDER[key]) PG_RENDER[key]();
+});
+
+/* ── 账号池：状态筛选 + 到期信息（原「积分到期提醒」表并入这里）── */
+let accFilter = 'all';
+
+// accDue 每日赠送积分的到期信息；没有每日余额返回 null。
+function accDue(a) {
+  const bal = Number(a && a.daily_balance || 0);
+  if (!bal || !a.daily_cycle_date) return null;
+  const cyc = new Date(a.daily_cycle_date + 'T00:00:00');
+  if (isNaN(cyc.getTime())) return null;
+  const exp = new Date(cyc.getTime() + 86400000);
+  const days = Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000));
+  return { days: days, remain: bal, quota: Number(a.daily_quota || 0), exp: exp,
+           checked: !!a.checkin_done };
+}
+
+// accRank 状态排序权重：可用 < 冷却 < 暂停 < 禁用。
+function accRank(a) {
+  if (a && a.disabled) return 3;
+  if (a && a.paused) return 2;
+  const cool = Math.max(Number(a && a.cooldown_seconds_left || 0), Number(a && a.breaker_seconds_left || 0));
+  if (cool > 0) return 1;
+  return a && a.session_valid ? 0 : 1;
+}
+
+function accMatch(a, f) {
+  if (!f || f === 'all') return true;
+  if (f === 'due') return !!accDue(a);
+  if (f === 'disabled') return !!a.disabled;
+  if (f === 'paused') return !!a.paused && !a.disabled;
+  if (f === 'ok') return accRank(a) === 0;
+  if (f === 'cool') return accRank(a) === 1 && !a.disabled && !a.paused;
+  return true;
+}
+
+const ACC_GET = {
+  name: a => String(a.name || '').toLowerCase(),
+  status: a => accRank(a),
+  credit: a => Number(a.available || 0),
+  ok: a => Number(a.success_count || 0),
+  inflight: a => Number(a.inflight || 0),
+  usage: a => Number((a.token_usage || {}).total_tokens || 0),
+  due: a => { const d = accDue(a); return d ? d.days : 9999; },
+  last: a => Number(a.last_success || 0),
+};
+
+const REQ_GET = {
+  time: e => Number(e && e.t || 0),
+  status: e => Number(e && e.status || 0),
+  latency: e => Number(e && e.latency_ms || 0),
+  tokens: e => Number(e && e.prompt || 0) + Number(e && e.completion || 0),
+  points: e => Number(e && e.points || 0),
+};
+
 /* ── 数字格式 ─────────────────────────────────────────────────────── */
 function fmtTok(n) {
   n = Number(n || 0);
@@ -489,9 +603,15 @@ function modelLocksHtml(cooldowns, now) {
 function renderAccounts(list) {
   const tb = $('accBody');
   LAST.acc = list;
-  const pageRows = pgApply('accBody', 'acc', list);
+  const visible = list.filter(a => accMatch(a, accFilter));
+  const pageRows = pgApply('accBody', 'acc', sortApply('acc', visible, ACC_GET, 'name', 1));
+  sortMark('accBody', 'acc');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用手机号 + 密码或验证码登录一个 Loomy 账号</div></td></tr>';
+    return;
+  }
+  if (!visible.length) {
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty">当前筛选没有匹配的账号</div></td></tr>';
     return;
   }
   const now = Date.now();
@@ -518,6 +638,19 @@ function renderAccounts(list) {
     const usageTitle = '累计：' + req + ' 次 / ' + fmtTok(tu.total_tokens) + ' tok / 均延迟 ' + latency +
       (rate === '—' ? '' : ' / ' + rate);
     const days = (s.session_days_left == null) ? '—' : s.session_days_left.toFixed(1) + 'd';
+    // 每日赠送积分的到期信息（原独立「积分到期提醒」表并入此列）
+    const due = accDue(s);
+    let dueCell = '<span class="muted">—</span>';
+    let dueTip = '没有每日赠送余额（长期积分不到期）';
+    if (due) {
+      const dTxt = due.days === 0 ? '今天' : due.days === 1 ? '明天' : due.days + ' 天';
+      dueCell = fmtPoints(due.remain) + '<div class="' + (due.days === 0 ? 'due-now' : 'due-in') + '">' + dTxt + '</div>';
+      dueTip = '该日到期 ' + fmtPoints(due.remain) + ' · 距到期 ' + due.days + ' 天' +
+        (due.quota ? ' · 每日额度 ' + fmtPoints(due.quota) : '') +
+        (due.checked ? ' · 今日已签到' : ' · 今日未签到') +
+        '\n日均需耗 ' + fmtPoints(Math.ceil(due.remain / Math.max(1, due.days))) +
+        '\n上游按失效时刻先后优先扣减（FEFO）';
+    }
     return '<tr class="' + st.cls + '" title="' + esc('账号 ' + s.name + (s.userid ? '\nuserid: ' + s.userid : '')) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + remarkName(s.name, esc(s.name || '未命名')) + '</div>' +
@@ -536,6 +669,7 @@ function renderAccounts(list) {
         '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
         '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
       '</span></td>' +
+      '<td class="num" title="' + esc(dueTip) + '">' + dueCell + '</td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success ? new Date(s.last_success * 1000).toISOString() : '') + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.name) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
@@ -617,32 +751,22 @@ function renderDeadModels(rows) {
 // renderExpiry 积分到期提醒（参考面板同区块）：Loomy 只有「每日赠送」会随周期失效，
 // 长期积分不到期。到期日 = daily_cycle_date 的次日 00:00；同一天的多个账号合并成一行。
 function renderExpiry(accounts) {
+  // 原独立表格已并入账号池（「到期」列 + 「有到期积分」筛选），这里只保留一行汇总：
+  // 同一批数据不再渲染两遍（136 个账号时那是 133 行重复）。
   const rows = [];
   for (const a of (accounts || [])) {
-    const bal = Number(a.daily_balance || 0);
-    if (!bal || !a.daily_cycle_date) continue;
-    const cyc = new Date(a.daily_cycle_date + 'T00:00:00');
-    if (isNaN(cyc.getTime())) continue;
-    const exp = new Date(cyc.getTime() + 86400000);
-    const days = Math.max(0, Math.ceil((exp.getTime() - Date.now()) / 86400000));
-    rows.push({ name: a.name, exp, days, remain: bal });
+    const d = accDue(a);
+    if (d) rows.push({ days: d.days, remain: d.remain, exp: d.exp });
   }
+  const note = $('expNote');
+  if (!note) return;
+  if (!rows.length) { note.textContent = ''; return; }
   rows.sort((x, y) => x.exp - y.exp);
-  const tb = $('expBody');
-  if (!tb) return;
-  LAST.exp = accounts;
-  const pageRows = pgApply('expBody', 'exp', rows);
-  tb.innerHTML = !rows.length
-    ? '<tr><td colspan="5"><div class="empty">暂无未来到期批次（长期积分不到期，每日额度为 0 时不入表）</div></td></tr>'
-    : pageRows.map(r => '<tr><td class="who"><div class="nm">' + esc(r.name) + '</div></td>' +
-        '<td>' + r.exp.toLocaleDateString('zh-CN') + '</td>' +
-        '<td class="num">' + (r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天') + '</td>' +
-        '<td class="num">' + fmtPoints(r.remain) + '</td>' +
-        '<td class="num">' + fmtPoints(Math.ceil(r.remain / Math.max(1, r.days))) + '</td></tr>').join('');
-  const total = rows.reduce((s, r) => s + r.remain, 0);
-  if ($('expNote')) $('expNote').textContent = rows.length ? rows.length + ' 个账号 · 合计 ' + fmtPoints(total) : '—';
+  const total = rows.reduce((n, r) => n + r.remain, 0);
+  const soon = rows.filter(r => r.days <= 1).length;
+  note.textContent = rows.length + ' 个账号有每日余额 · 合计 ' + fmtPoints(total) +
+    (soon ? ' · ' + soon + ' 个 1 天内到期' : '');
 }
-
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -1036,9 +1160,10 @@ function reqToolCell(e) {
   return called ? text : '<span class="tag warn" title="声明了工具但一次没调用">' + text + '</span>';
 }
 function renderRequestTable() {
-  const list = reqEntries.filter(e => reqMatch(e));
+  const list = sortApply('req', reqEntries.filter(e => reqMatch(e)), REQ_GET, 'time', -1);
   pgSig('req', JSON.stringify(reqFilter));
   const pageRows = pgApply('reqBody', 'req', list);
+  sortMark('reqBody', 'req');
   const tb = $('reqBody');
   tb.innerHTML = pageRows.map(e => {
     const when = e && e.t ? new Date(e.t * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
@@ -1185,6 +1310,7 @@ $('btnReqReload').onclick = loadLogs;
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
 trangeBind('reqRange', loadLogs, '0');
+$('accFilter').onchange = () => { accFilter = $('accFilter').value; PG.acc.page = 0; renderAccounts(LAST.acc || []); };
 $('creditLimit').onchange = loadCreditHistory;
 $('btnCreditReload').onclick = loadCreditHistory;
 
@@ -2275,7 +2401,7 @@ $('btnRemarkSave').onclick = saveRemarkForm;
 
 /* ── 分页重渲染登记：换页 / 改每页条数时，各列表从缓存数据重画当前页 ── */
 PG_RENDER.acc = () => renderAccounts(LAST.acc || []);
-PG_RENDER.exp = () => renderExpiry(LAST.exp || []);
+PG_RENDER.exp = () => renderExpiry(LAST.acc || []);
 PG_RENDER.ml = () => renderModelLocks(LAST.ml || []);
 PG_RENDER.dm = () => renderDeadModels(LAST.dm || []);
 PG_RENDER.md = () => renderModels();
